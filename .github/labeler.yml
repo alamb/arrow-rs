@@ -1,0 +1,12 @@
+# Label PRs based on changes to crates (see https://github.com/actions/labeler)
+arrow:
+  any: ['arrow/**/*']
+
+arrow-flight:
+  any: ['arrow-flight/**/*']
+
+development-process:
+  any: ['dev/**/*']
+
+parquet:
+  any: ['parquet/**/*', 'parquet-testing/**/*', 'parquet_derive/**/*','parquet_derive_test/**/*']
