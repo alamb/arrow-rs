@@ -23,6 +23,8 @@
 
 This crate contains a native Rust implementation of the [Arrow columnar format](https://arrow.apache.org/docs/format/Columnar.html).
 
+Test
+
 ## Developer's guide
 
 Common information for all Rust libraries in this project, including
