@@ -508,6 +508,30 @@ mod tests {
     }
 
     #[test]
+    fn test_string_dictionary_repeated_dictionary() {
+        let array : DictionaryArray<Int8Type> = vec!["a", "a", "b", "c"].into_iter().collect();
+        let array_copy: DictionaryArray<Int8Type> = array.data().clone().into();
+
+        // dictionary is "a", "b", "c"
+        assert_eq!(array.values(), &(Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef));
+        assert_eq!(array.keys(), &Int8Array::from(vec![0, 0, 1, 2]));
+
+        // concatenate it with itself
+        let combined = concat(&[&array_copy as _, &array as _])
+            .unwrap();
+        let combined = combined
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int8Type>>()
+            .unwrap();
+
+        // Since dictionares are the same, no need a copy -- it could be the same "a", "b", "c"
+        // assert_eq!(combined.values(), &(Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef),
+        //            "Actual: {:#?}", combined);
+        assert_eq!(combined.keys(), &Int8Array::from(vec![0, 0, 1, 2, 0, 0, 1, 2]));
+    }
+
+
+    #[test]
     fn test_concat_string_sizes() -> Result<()> {
         let a: LargeStringArray = ((0..150).map(|_| Some("foo"))).collect();
         let b: LargeStringArray = ((0..150).map(|_| Some("foo"))).collect();
