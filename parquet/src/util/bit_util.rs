@@ -223,7 +223,7 @@ impl BitWriter {
         }
     }
 
-    /// Extend buffer size
+    /// Extend buffer size by `increment` bytes
     #[inline]
     pub fn extend(&mut self, increment: usize) {
         self.max_bytes += increment;
@@ -231,7 +231,7 @@ impl BitWriter {
         self.buffer.extend(extra);
     }
 
-    /// Report buffer size
+    /// Report buffer size, in bytes
     #[inline]
     pub fn capacity(&mut self) -> usize {
         self.max_bytes
@@ -332,6 +332,7 @@ impl BitWriter {
         self.max_bytes
     }
 
+    /// Writes the entire byte `value` at the byte `offset`
     pub fn write_at(&mut self, offset: usize, value: u8) {
         self.buffer[offset] = value;
     }
@@ -679,6 +680,15 @@ impl From<Vec<u8>> for BitReader {
     }
 }
 
+/// Returns the nearest multiple of `factor` that is `>=` than `num`. Here `factor` must
+/// be a power of 2.
+///
+/// Copied from the arrow crate to make arrow optional
+pub fn round_upto_power_of_2(num: usize, factor: usize) -> usize {
+    debug_assert!(factor > 0 && (factor & (factor - 1)) == 0);
+    (num + (factor - 1)) & !(factor - 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_common::*;
@@ -802,28 +812,28 @@ mod tests {
     #[test]
     fn test_get_bit() {
         // 00001101
-        assert_eq!(true, get_bit(&[0b00001101], 0));
-        assert_eq!(false, get_bit(&[0b00001101], 1));
-        assert_eq!(true, get_bit(&[0b00001101], 2));
-        assert_eq!(true, get_bit(&[0b00001101], 3));
+        assert!(get_bit(&[0b00001101], 0));
+        assert!(!get_bit(&[0b00001101], 1));
+        assert!(get_bit(&[0b00001101], 2));
+        assert!(get_bit(&[0b00001101], 3));
 
         // 01001001 01010010
-        assert_eq!(true, get_bit(&[0b01001001, 0b01010010], 0));
-        assert_eq!(false, get_bit(&[0b01001001, 0b01010010], 1));
-        assert_eq!(false, get_bit(&[0b01001001, 0b01010010], 2));
-        assert_eq!(true, get_bit(&[0b01001001, 0b01010010], 3));
-        assert_eq!(false, get_bit(&[0b01001001, 0b01010010], 4));
-        assert_eq!(false, get_bit(&[0b01001001, 0b01010010], 5));
-        assert_eq!(true, get_bit(&[0b01001001, 0b01010010], 6));
-        assert_eq!(false, get_bit(&[0b01001001, 0b01010010], 7));
-        assert_eq!(false, get_bit(&[0b01001001, 0b01010010], 8));
-        assert_eq!(true, get_bit(&[0b01001001, 0b01010010], 9));
-        assert_eq!(false, get_bit(&[0b01001001, 0b01010010], 10));
-        assert_eq!(false, get_bit(&[0b01001001, 0b01010010], 11));
-        assert_eq!(true, get_bit(&[0b01001001, 0b01010010], 12));
-        assert_eq!(false, get_bit(&[0b01001001, 0b01010010], 13));
-        assert_eq!(true, get_bit(&[0b01001001, 0b01010010], 14));
-        assert_eq!(false, get_bit(&[0b01001001, 0b01010010], 15));
+        assert!(get_bit(&[0b01001001, 0b01010010], 0));
+        assert!(!get_bit(&[0b01001001, 0b01010010], 1));
+        assert!(!get_bit(&[0b01001001, 0b01010010], 2));
+        assert!(get_bit(&[0b01001001, 0b01010010], 3));
+        assert!(!get_bit(&[0b01001001, 0b01010010], 4));
+        assert!(!get_bit(&[0b01001001, 0b01010010], 5));
+        assert!(get_bit(&[0b01001001, 0b01010010], 6));
+        assert!(!get_bit(&[0b01001001, 0b01010010], 7));
+        assert!(!get_bit(&[0b01001001, 0b01010010], 8));
+        assert!(get_bit(&[0b01001001, 0b01010010], 9));
+        assert!(!get_bit(&[0b01001001, 0b01010010], 10));
+        assert!(!get_bit(&[0b01001001, 0b01010010], 11));
+        assert!(get_bit(&[0b01001001, 0b01010010], 12));
+        assert!(!get_bit(&[0b01001001, 0b01010010], 13));
+        assert!(get_bit(&[0b01001001, 0b01010010], 14));
+        assert!(!get_bit(&[0b01001001, 0b01010010], 15));
     }
 
     #[test]
@@ -926,8 +936,8 @@ mod tests {
                 .get_value::<bool>(1)
                 .expect("get_value() should return OK");
             match i {
-                0 | 1 | 4 | 5 => assert_eq!(val, false),
-                _ => assert_eq!(val, true),
+                0 | 1 | 4 | 5 => assert!(!val),
+                _ => assert!(val),
             }
         }
     }

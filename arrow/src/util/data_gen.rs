@@ -192,15 +192,17 @@ fn create_random_list_array(
         true => Some(create_random_null_buffer(size, null_density)),
         false => None,
     };
-    let list_data = ArrayData::new(
-        field.data_type().clone(),
-        size,
-        None,
-        null_buffer,
-        0,
-        vec![offsets],
-        vec![child_data.clone()],
-    );
+    let list_data = unsafe {
+        ArrayData::new_unchecked(
+            field.data_type().clone(),
+            size,
+            None,
+            null_buffer,
+            0,
+            vec![offsets],
+            vec![child_data.clone()],
+        )
+    };
     Ok(make_array(list_data))
 }
 
@@ -218,7 +220,7 @@ fn create_random_offsets<T: OffsetSizeTrait + SampleUniform>(
     offsets.push(current_offset);
 
     (0..size).for_each(|_| {
-        current_offset += rng.gen_range(min, max);
+        current_offset += rng.gen_range(min..max);
         offsets.push(current_offset);
     });
 

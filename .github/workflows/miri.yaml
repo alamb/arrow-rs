@@ -30,7 +30,7 @@ jobs:
     strategy:
       matrix:
         arch: [amd64]
-        rust: [nightly-2021-03-24]
+        rust: [nightly-2021-07-04]
     steps:
       - uses: actions/checkout@v2
         with:
@@ -57,4 +57,4 @@ jobs:
           cargo clean
           # Currently only the arrow crate is tested with miri
           # IO related tests and some unsupported tests are skipped
-          cargo miri test -p arrow -- --skip csv --skip ipc --skip json || true
+          cargo miri test -p arrow -- --skip csv --skip ipc --skip json

@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::any::Any;
+use std::convert::{From, TryFrom};
 use std::fmt;
 use std::sync::Arc;
-use std::{any::Any, convert::TryFrom};
 
 use super::*;
 use crate::array::equal_json::JsonEqual;
@@ -54,7 +55,7 @@ pub trait Array: fmt::Debug + Send + Sync + JsonEqual {
     /// # Ok(())
     /// # }
     /// ```
-    fn as_any(&self) -> &Any;
+    fn as_any(&self) -> &dyn Any;
 
     /// Returns a reference to the underlying data of this array.
     fn data(&self) -> &ArrayData;
@@ -197,11 +198,21 @@ pub trait Array: fmt::Debug + Send + Sync + JsonEqual {
         self.data_ref().null_count()
     }
 
-    /// Returns the total number of bytes of memory occupied by the buffers owned by this array.
-    fn get_buffer_memory_size(&self) -> usize;
+    /// Returns the total number of bytes of memory pointed to by this array.
+    /// The buffers store bytes in the Arrow memory format, and include the data as well as the validity map.
+    fn get_buffer_memory_size(&self) -> usize {
+        self.data_ref().get_buffer_memory_size()
+    }
 
     /// Returns the total number of bytes of memory occupied physically by this array.
-    fn get_array_memory_size(&self) -> usize;
+    /// This value will always be greater than returned by `get_buffer_memory_size()` and
+    /// includes the overhead of the data structures that contain the pointers to the various buffers.
+    fn get_array_memory_size(&self) -> usize {
+        // both data.get_array_memory_size and size_of_val(self) include ArrayData fields,
+        // to only count additional fields of this array substract size_of(ArrayData)
+        self.data_ref().get_array_memory_size() + std::mem::size_of_val(self)
+            - std::mem::size_of::<ArrayData>()
+    }
 
     /// returns two pointers that represent this array in the C Data Interface (FFI)
     fn to_raw(
@@ -214,7 +225,7 @@ pub trait Array: fmt::Debug + Send + Sync + JsonEqual {
 }
 
 /// A reference-counted reference to a generic `Array`.
-pub type ArrayRef = Arc<Array>;
+pub type ArrayRef = Arc<dyn Array>;
 
 /// Constructs an array using the input `data`.
 /// Returns a reference-counted `Array` instance.
@@ -286,6 +297,7 @@ pub fn make_array(data: ArrayData) -> ArrayRef {
         DataType::List(_) => Arc::new(ListArray::from(data)) as ArrayRef,
         DataType::LargeList(_) => Arc::new(LargeListArray::from(data)) as ArrayRef,
         DataType::Struct(_) => Arc::new(StructArray::from(data)) as ArrayRef,
+        DataType::Map(_, _) => Arc::new(MapArray::from(data)) as ArrayRef,
         DataType::Union(_) => Arc::new(UnionArray::from(data)) as ArrayRef,
         DataType::FixedSizeList(_, _) => {
             Arc::new(FixedSizeListArray::from(data)) as ArrayRef
@@ -320,6 +332,12 @@ pub fn make_array(data: ArrayData) -> ArrayRef {
         DataType::Null => Arc::new(NullArray::from(data)) as ArrayRef,
         DataType::Decimal(_, _) => Arc::new(DecimalArray::from(data)) as ArrayRef,
         dt => panic!("Unexpected data type {:?}", dt),
+    }
+}
+
+impl From<ArrayData> for ArrayRef {
+    fn from(data: ArrayData) -> Self {
+        make_array(data)
     }
 }
 
@@ -359,15 +377,17 @@ pub fn new_null_array(data_type: &DataType, length: usize) -> ArrayRef {
         DataType::Null => Arc::new(NullArray::new(length)),
         DataType::Boolean => {
             let null_buf: Buffer = MutableBuffer::new_null(length).into();
-            make_array(ArrayData::new(
-                data_type.clone(),
-                length,
-                Some(length),
-                Some(null_buf.clone()),
-                0,
-                vec![null_buf],
-                vec![],
-            ))
+            make_array(unsafe {
+                ArrayData::new_unchecked(
+                    data_type.clone(),
+                    length,
+                    Some(length),
+                    Some(null_buf.clone()),
+                    0,
+                    vec![null_buf],
+                    vec![],
+                )
+            })
         }
         DataType::Int8 => new_null_sized_array::<Int8Type>(data_type, length),
         DataType::UInt8 => new_null_sized_array::<UInt8Type>(data_type, length),
@@ -396,15 +416,17 @@ pub fn new_null_array(data_type: &DataType, length: usize) -> ArrayRef {
                 new_null_sized_array::<IntervalDayTimeType>(data_type, length)
             }
         },
-        DataType::FixedSizeBinary(value_len) => make_array(ArrayData::new(
-            data_type.clone(),
-            length,
-            Some(length),
-            Some(MutableBuffer::new_null(length).into()),
-            0,
-            vec![Buffer::from(vec![0u8; *value_len as usize * length])],
-            vec![],
-        )),
+        DataType::FixedSizeBinary(value_len) => make_array(unsafe {
+            ArrayData::new_unchecked(
+                data_type.clone(),
+                length,
+                Some(length),
+                Some(MutableBuffer::new_null(length).into()),
+                0,
+                vec![Buffer::from(vec![0u8; *value_len as usize * length])],
+                vec![],
+            )
+        }),
         DataType::Binary | DataType::Utf8 => {
             new_null_binary_array::<i32>(data_type, length)
         }
@@ -417,31 +439,33 @@ pub fn new_null_array(data_type: &DataType, length: usize) -> ArrayRef {
         DataType::LargeList(field) => {
             new_null_list_array::<i64>(data_type, field.data_type(), length)
         }
-        DataType::FixedSizeList(field, value_len) => make_array(ArrayData::new(
-            data_type.clone(),
-            length,
-            Some(length),
-            Some(MutableBuffer::new_null(length).into()),
-            0,
-            vec![],
-            vec![
-                new_null_array(field.data_type(), *value_len as usize * length)
-                    .data()
-                    .clone(),
-            ],
-        )),
-        DataType::Struct(fields) => make_array(ArrayData::new(
-            data_type.clone(),
-            length,
-            Some(length),
-            Some(MutableBuffer::new_null(length).into()),
-            0,
-            vec![],
-            fields
+        DataType::FixedSizeList(field, value_len) => make_array(unsafe {
+            ArrayData::new_unchecked(
+                data_type.clone(),
+                length,
+                Some(length),
+                Some(MutableBuffer::new_null(length).into()),
+                0,
+                vec![],
+                vec![
+                    new_null_array(field.data_type(), *value_len as usize * length)
+                        .data()
+                        .clone(),
+                ],
+            )
+        }),
+        DataType::Struct(fields) => {
+            let fields: Vec<_> = fields
                 .iter()
-                .map(|field| ArrayData::new_empty(field.data_type()))
-                .collect(),
-        )),
+                .map(|field| (field.clone(), new_null_array(field.data_type(), length)))
+                .collect();
+
+            let null_buffer = MutableBuffer::new_null(length);
+            Arc::new(StructArray::from((fields, null_buffer.into())))
+        }
+        DataType::Map(field, _keys_sorted) => {
+            new_null_list_array::<i32>(data_type, field.data_type(), length)
+        }
         DataType::Union(_) => {
             unimplemented!("Creating null Union array not yet supported")
         }
@@ -449,15 +473,17 @@ pub fn new_null_array(data_type: &DataType, length: usize) -> ArrayRef {
             let keys = new_null_array(key, length);
             let keys = keys.data();
 
-            make_array(ArrayData::new(
-                data_type.clone(),
-                length,
-                Some(length),
-                keys.null_buffer().cloned(),
-                0,
-                keys.buffers().into(),
-                vec![new_empty_array(value.as_ref()).data().clone()],
-            ))
+            make_array(unsafe {
+                ArrayData::new_unchecked(
+                    data_type.clone(),
+                    length,
+                    Some(length),
+                    keys.null_buffer().cloned(),
+                    0,
+                    keys.buffers().into(),
+                    vec![new_empty_array(value.as_ref()).data().clone()],
+                )
+            })
         }
         DataType::Decimal(_, _) => {
             unimplemented!("Creating null Decimal array not yet supported")
@@ -471,17 +497,19 @@ fn new_null_list_array<OffsetSize: OffsetSizeTrait>(
     child_data_type: &DataType,
     length: usize,
 ) -> ArrayRef {
-    make_array(ArrayData::new(
-        data_type.clone(),
-        length,
-        Some(length),
-        Some(MutableBuffer::new_null(length).into()),
-        0,
-        vec![Buffer::from(
-            vec![OffsetSize::zero(); length + 1].to_byte_slice(),
-        )],
-        vec![ArrayData::new_empty(child_data_type)],
-    ))
+    make_array(unsafe {
+        ArrayData::new_unchecked(
+            data_type.clone(),
+            length,
+            Some(length),
+            Some(MutableBuffer::new_null(length).into()),
+            0,
+            vec![Buffer::from(
+                vec![OffsetSize::zero(); length + 1].to_byte_slice(),
+            )],
+            vec![ArrayData::new_empty(child_data_type)],
+        )
+    })
 }
 
 #[inline]
@@ -489,18 +517,20 @@ fn new_null_binary_array<OffsetSize: OffsetSizeTrait>(
     data_type: &DataType,
     length: usize,
 ) -> ArrayRef {
-    make_array(ArrayData::new(
-        data_type.clone(),
-        length,
-        Some(length),
-        Some(MutableBuffer::new_null(length).into()),
-        0,
-        vec![
-            Buffer::from(vec![OffsetSize::zero(); length + 1].to_byte_slice()),
-            MutableBuffer::new(0).into(),
-        ],
-        vec![],
-    ))
+    make_array(unsafe {
+        ArrayData::new_unchecked(
+            data_type.clone(),
+            length,
+            Some(length),
+            Some(MutableBuffer::new_null(length).into()),
+            0,
+            vec![
+                Buffer::from(vec![OffsetSize::zero(); length + 1].to_byte_slice()),
+                MutableBuffer::new(0).into(),
+            ],
+            vec![],
+        )
+    })
 }
 
 #[inline]
@@ -508,15 +538,17 @@ fn new_null_sized_array<T: ArrowPrimitiveType>(
     data_type: &DataType,
     length: usize,
 ) -> ArrayRef {
-    make_array(ArrayData::new(
-        data_type.clone(),
-        length,
-        Some(length),
-        Some(MutableBuffer::new_null(length).into()),
-        0,
-        vec![Buffer::from(vec![0u8; length * T::get_byte_width()])],
-        vec![],
-    ))
+    make_array(unsafe {
+        ArrayData::new_unchecked(
+            data_type.clone(),
+            length,
+            Some(length),
+            Some(MutableBuffer::new_null(length).into()),
+            0,
+            vec![Buffer::from(vec![0u8; length * T::get_byte_width()])],
+            vec![],
+        )
+    })
 }
 
 /// Creates a new array from two FFI pointers. Used to import arrays from the C Data Interface
@@ -548,7 +580,7 @@ where
             writeln!(f, "  null,")?;
         } else {
             write!(f, "  ")?;
-            print_item(&array, i, f)?;
+            print_item(array, i, f)?;
             writeln!(f, ",")?;
         }
     }
@@ -564,7 +596,7 @@ where
                 writeln!(f, "  null,")?;
             } else {
                 write!(f, "  ")?;
-                print_item(&array, i, f)?;
+                print_item(array, i, f)?;
                 writeln!(f, ",")?;
             }
         }
@@ -575,6 +607,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn test_empty_primitive() {
         let array = new_empty_array(&DataType::Int32);
@@ -623,6 +656,23 @@ mod tests {
     }
 
     #[test]
+    fn test_null_struct() {
+        let struct_type =
+            DataType::Struct(vec![Field::new("data", DataType::Int64, false)]);
+        let array = new_null_array(&struct_type, 9);
+
+        let a = array.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(a.len(), 9);
+        assert_eq!(a.column(0).len(), 9);
+        for i in 0..9 {
+            assert!(a.is_null(i));
+        }
+
+        // Make sure we can slice the resulting array.
+        a.slice(0, 5);
+    }
+
+    #[test]
     fn test_null_variable_sized() {
         let array = new_null_array(&DataType::Utf8, 9);
         let a = array.as_any().downcast_ref::<StringArray>().unwrap();
@@ -647,6 +697,28 @@ mod tests {
     }
 
     #[test]
+    fn test_null_map() {
+        let data_type = DataType::Map(
+            Box::new(Field::new(
+                "entry",
+                DataType::Struct(vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", DataType::Int32, true),
+                ]),
+                false,
+            )),
+            false,
+        );
+        let array = new_null_array(&data_type, 9);
+        let a = array.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(a.len(), 9);
+        assert_eq!(a.value_offsets()[9], 0i32);
+        for i in 0..9 {
+            assert!(a.is_null(i));
+        }
+    }
+
+    #[test]
     fn test_null_dictionary() {
         let values = vec![None, None, None, None, None, None, None, None, None]
             as Vec<Option<&str>>;
@@ -659,6 +731,110 @@ mod tests {
         assert_eq!(
             array.data().buffers()[0].len(),
             null_array.data().buffers()[0].len()
+        );
+    }
+
+    #[test]
+    fn test_memory_size_null() {
+        let null_arr = NullArray::new(32);
+
+        assert_eq!(0, null_arr.get_buffer_memory_size());
+        assert_eq!(
+            std::mem::size_of::<NullArray>(),
+            null_arr.get_array_memory_size()
+        );
+        assert_eq!(
+            std::mem::size_of::<NullArray>(),
+            std::mem::size_of::<ArrayData>(),
+        );
+    }
+
+    #[test]
+    fn test_memory_size_primitive() {
+        let arr = PrimitiveArray::<Int64Type>::from_iter_values(0..128);
+        let empty =
+            PrimitiveArray::<Int64Type>::from(ArrayData::new_empty(arr.data_type()));
+
+        // substract empty array to avoid magic numbers for the size of additional fields
+        assert_eq!(
+            arr.get_array_memory_size() - empty.get_array_memory_size(),
+            128 * std::mem::size_of::<i64>()
+        );
+    }
+
+    #[test]
+    fn test_memory_size_primitive_nullable() {
+        let arr: PrimitiveArray<Int64Type> = (0..128).map(Some).collect();
+        let empty_with_bitmap = PrimitiveArray::<Int64Type>::from(
+            ArrayData::builder(arr.data_type().clone())
+                .add_buffer(MutableBuffer::new(0).into())
+                .null_bit_buffer(MutableBuffer::new_null(0).into())
+                .build()
+                .unwrap(),
+        );
+
+        // expected size is the size of the PrimitiveArray struct,
+        // which includes the optional validity buffer
+        // plus one buffer on the heap
+        assert_eq!(
+            std::mem::size_of::<PrimitiveArray<Int64Type>>()
+                + std::mem::size_of::<Buffer>(),
+            empty_with_bitmap.get_array_memory_size()
+        );
+
+        // substract empty array to avoid magic numbers for the size of additional fields
+        // the size of the validity bitmap is rounded up to 64 bytes
+        assert_eq!(
+            arr.get_array_memory_size() - empty_with_bitmap.get_array_memory_size(),
+            128 * std::mem::size_of::<i64>() + 64
+        );
+    }
+
+    #[test]
+    fn test_memory_size_dictionary() {
+        let values = PrimitiveArray::<Int64Type>::from_iter_values(0..16);
+        let keys = PrimitiveArray::<Int16Type>::from_iter_values(
+            (0..256).map(|i| (i % values.len()) as i16),
+        );
+
+        let dict_data = ArrayData::builder(DataType::Dictionary(
+            Box::new(keys.data_type().clone()),
+            Box::new(values.data_type().clone()),
+        ))
+        .len(keys.len())
+        .buffers(keys.data_ref().buffers().to_vec())
+        .child_data(vec![ArrayData::builder(DataType::Int64)
+            .len(values.len())
+            .buffers(values.data_ref().buffers().to_vec())
+            .build()
+            .unwrap()])
+        .build()
+        .unwrap();
+
+        let empty_data = ArrayData::new_empty(&DataType::Dictionary(
+            Box::new(DataType::Int16),
+            Box::new(DataType::Int64),
+        ));
+
+        let arr = DictionaryArray::<Int16Type>::from(dict_data);
+        let empty = DictionaryArray::<Int16Type>::from(empty_data);
+
+        let expected_keys_size = 256 * std::mem::size_of::<i16>();
+        assert_eq!(
+            arr.keys().get_array_memory_size() - empty.keys().get_array_memory_size(),
+            expected_keys_size
+        );
+
+        let expected_values_size = 16 * std::mem::size_of::<i64>();
+        assert_eq!(
+            arr.values().get_array_memory_size() - empty.values().get_array_memory_size(),
+            expected_values_size
+        );
+
+        let expected_size = expected_keys_size + expected_values_size;
+        assert_eq!(
+            arr.get_array_memory_size() - empty.get_array_memory_size(),
+            expected_size
         );
     }
 }

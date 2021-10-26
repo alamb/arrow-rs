@@ -18,7 +18,6 @@
 use std::borrow::Borrow;
 use std::convert::From;
 use std::iter::{FromIterator, IntoIterator};
-use std::mem;
 use std::{any::Any, fmt};
 
 use super::*;
@@ -48,6 +47,23 @@ use crate::util::bit_util;
 ///     assert_eq!(true, arr.value(3));
 /// ```
 ///
+/// Using `from_iter`
+/// ```
+///     use arrow::array::{Array, BooleanArray};
+///     let v = vec![Some(false), Some(true), Some(false), Some(true)];
+///     let arr = v.into_iter().collect::<BooleanArray>();
+///     assert_eq!(4, arr.len());
+///     assert_eq!(0, arr.offset());
+///     assert_eq!(0, arr.null_count());
+///     assert!(arr.is_valid(0));
+///     assert_eq!(false, arr.value(0));
+///     assert!(arr.is_valid(1));
+///     assert_eq!(true, arr.value(1));
+///     assert!(arr.is_valid(2));
+///     assert_eq!(false, arr.value(2));
+///     assert!(arr.is_valid(3));
+///     assert_eq!(true, arr.value(3));
+/// ```
 pub struct BooleanArray {
     data: ArrayData,
     /// Pointer to the value array. The lifetime of this must be <= to the value buffer
@@ -99,30 +115,22 @@ impl BooleanArray {
 
     /// Returns the boolean value at index `i`.
     ///
-    /// Note this doesn't do any bound checking, for performance reason.
+    /// Panics of offset `i` is out of bounds
     pub fn value(&self, i: usize) -> bool {
-        debug_assert!(i < self.len());
+        assert!(i < self.len());
+        // Safety:
+        // `i < self.len()
         unsafe { self.value_unchecked(i) }
     }
 }
 
 impl Array for BooleanArray {
-    fn as_any(&self) -> &Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn data(&self) -> &ArrayData {
         &self.data
-    }
-
-    /// Returns the total number of bytes of memory occupied by the buffers owned by this [BooleanArray].
-    fn get_buffer_memory_size(&self) -> usize {
-        self.data.get_buffer_memory_size()
-    }
-
-    /// Returns the total number of bytes of memory occupied physically by this [BooleanArray].
-    fn get_array_memory_size(&self) -> usize {
-        self.data.get_array_memory_size() + mem::size_of_val(self)
     }
 }
 
@@ -139,15 +147,16 @@ impl From<Vec<bool>> for BooleanArray {
         }
         let array_data = ArrayData::builder(DataType::Boolean)
             .len(data.len())
-            .add_buffer(mut_buf.into())
-            .build();
+            .add_buffer(mut_buf.into());
+
+        let array_data = unsafe { array_data.build_unchecked() };
         BooleanArray::from(array_data)
     }
 }
 
 impl From<Vec<Option<bool>>> for BooleanArray {
     fn from(data: Vec<Option<bool>>) -> Self {
-        BooleanArray::from_iter(data.iter())
+        data.iter().collect()
     }
 }
 
@@ -178,7 +187,7 @@ impl<'a> IntoIterator for &'a BooleanArray {
 impl<'a> BooleanArray {
     /// constructs a new iterator
     pub fn iter(&'a self) -> BooleanIter<'a> {
-        BooleanIter::<'a>::new(&self)
+        BooleanIter::<'a>::new(self)
     }
 }
 
@@ -204,15 +213,17 @@ impl<Ptr: Borrow<Option<bool>>> FromIterator<Ptr> for BooleanArray {
             }
         });
 
-        let data = ArrayData::new(
-            DataType::Boolean,
-            data_len,
-            None,
-            Some(null_buf.into()),
-            0,
-            vec![val_buf.into()],
-            vec![],
-        );
+        let data = unsafe {
+            ArrayData::new_unchecked(
+                DataType::Boolean,
+                data_len,
+                None,
+                Some(null_buf.into()),
+                0,
+                vec![val_buf.into()],
+                vec![],
+            )
+        };
         BooleanArray::from(data)
     }
 }
@@ -282,6 +293,20 @@ mod tests {
     }
 
     #[test]
+    fn test_boolean_array_from_iter() {
+        let v = vec![Some(false), Some(true), Some(false), Some(true)];
+        let arr = v.into_iter().collect::<BooleanArray>();
+        assert_eq!(4, arr.len());
+        assert_eq!(0, arr.offset());
+        assert_eq!(0, arr.null_count());
+        for i in 0..3 {
+            assert!(!arr.is_null(i));
+            assert!(arr.is_valid(i));
+            assert_eq!(i == 1 || i == 3, arr.value(i), "failed at {}", i)
+        }
+    }
+
+    #[test]
     fn test_boolean_array_builder() {
         // Test building a boolean array with ArrayData builder and offset
         // 000011011
@@ -291,7 +316,8 @@ mod tests {
             .len(5)
             .offset(2)
             .add_buffer(buf)
-            .build();
+            .build()
+            .unwrap();
         let arr = BooleanArray::from(data);
         assert_eq!(&buf2, arr.values());
         assert_eq!(5, arr.len());
@@ -306,7 +332,10 @@ mod tests {
     #[should_panic(expected = "BooleanArray data should contain a single buffer only \
                                (values buffer)")]
     fn test_boolean_array_invalid_buffer_len() {
-        let data = ArrayData::builder(DataType::Boolean).len(5).build();
+        let data = ArrayData::builder(DataType::Boolean)
+            .len(5)
+            .build()
+            .unwrap();
         BooleanArray::from(data);
     }
 }

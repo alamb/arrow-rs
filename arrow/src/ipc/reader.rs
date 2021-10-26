@@ -89,7 +89,7 @@ fn create_array(
             buffer_index += 2;
             array
         }
-        List(ref list_field) | LargeList(ref list_field) => {
+        List(ref list_field) | LargeList(ref list_field) | Map(ref list_field, _) => {
             let list_node = &nodes[node_index];
             let list_buffers: Vec<Buffer> = buffers[buffer_index..buffer_index + 2]
                 .iter()
@@ -189,7 +189,8 @@ fn create_array(
             let data = ArrayData::builder(data_type.clone())
                 .len(length)
                 .offset(0)
-                .build();
+                .build()
+                .unwrap();
             node_index += 1;
             // no buffer increases
             make_array(data)
@@ -230,7 +231,7 @@ fn create_primitive_array(
             if null_count > 0 {
                 builder = builder.null_bit_buffer(buffers[0].clone())
             }
-            builder.build()
+            builder.build().unwrap()
         }
         FixedSizeBinary(_) => {
             // read 3 buffers
@@ -241,7 +242,7 @@ fn create_primitive_array(
             if null_count > 0 {
                 builder = builder.null_bit_buffer(buffers[0].clone())
             }
-            builder.build()
+            unsafe { builder.build_unchecked() }
         }
         Int8
         | Int16
@@ -261,7 +262,8 @@ fn create_primitive_array(
                 if null_count > 0 {
                     builder = builder.null_bit_buffer(buffers[0].clone())
                 }
-                let values = Arc::new(Int64Array::from(builder.build())) as ArrayRef;
+                let data = unsafe { builder.build_unchecked() };
+                let values = Arc::new(Int64Array::from(data)) as ArrayRef;
                 // this cast is infallible, the unwrap is safe
                 let casted = cast(&values, data_type).unwrap();
                 casted.data().clone()
@@ -273,7 +275,7 @@ fn create_primitive_array(
                 if null_count > 0 {
                     builder = builder.null_bit_buffer(buffers[0].clone())
                 }
-                builder.build()
+                unsafe { builder.build_unchecked() }
             }
         }
         Float32 => {
@@ -286,7 +288,8 @@ fn create_primitive_array(
                 if null_count > 0 {
                     builder = builder.null_bit_buffer(buffers[0].clone())
                 }
-                let values = Arc::new(Float64Array::from(builder.build())) as ArrayRef;
+                let data = unsafe { builder.build_unchecked() };
+                let values = Arc::new(Float64Array::from(data)) as ArrayRef;
                 // this cast is infallible, the unwrap is safe
                 let casted = cast(&values, data_type).unwrap();
                 casted.data().clone()
@@ -298,7 +301,7 @@ fn create_primitive_array(
                 if null_count > 0 {
                     builder = builder.null_bit_buffer(buffers[0].clone())
                 }
-                builder.build()
+                unsafe { builder.build_unchecked() }
             }
         }
         Boolean
@@ -317,7 +320,7 @@ fn create_primitive_array(
             if null_count > 0 {
                 builder = builder.null_bit_buffer(buffers[0].clone())
             }
-            builder.build()
+            unsafe { builder.build_unchecked() }
         }
         Decimal(_, _) => {
             // read 3 buffers
@@ -328,7 +331,7 @@ fn create_primitive_array(
             if null_count > 0 {
                 builder = builder.null_bit_buffer(buffers[0].clone())
             }
-            builder.build()
+            unsafe { builder.build_unchecked() }
         }
         t => panic!("Data type {:?} either unsupported or not primitive", t),
     };
@@ -344,7 +347,7 @@ fn create_list_array(
     buffers: &[Buffer],
     child_array: ArrayRef,
 ) -> ArrayRef {
-    if let DataType::List(_) = *data_type {
+    if let DataType::List(_) | DataType::LargeList(_) = *data_type {
         let null_count = field_node.null_count() as usize;
         let mut builder = ArrayData::builder(data_type.clone())
             .len(field_node.length() as usize)
@@ -354,18 +357,7 @@ fn create_list_array(
         if null_count > 0 {
             builder = builder.null_bit_buffer(buffers[0].clone())
         }
-        make_array(builder.build())
-    } else if let DataType::LargeList(_) = *data_type {
-        let null_count = field_node.null_count() as usize;
-        let mut builder = ArrayData::builder(data_type.clone())
-            .len(field_node.length() as usize)
-            .buffers(buffers[1..2].to_vec())
-            .offset(0)
-            .child_data(vec![child_array.data().clone()]);
-        if null_count > 0 {
-            builder = builder.null_bit_buffer(buffers[0].clone())
-        }
-        make_array(builder.build())
+        make_array(unsafe { builder.build_unchecked() })
     } else if let DataType::FixedSizeList(_, _) = *data_type {
         let null_count = field_node.null_count() as usize;
         let mut builder = ArrayData::builder(data_type.clone())
@@ -376,9 +368,20 @@ fn create_list_array(
         if null_count > 0 {
             builder = builder.null_bit_buffer(buffers[0].clone())
         }
-        make_array(builder.build())
+        make_array(unsafe { builder.build_unchecked() })
+    } else if let DataType::Map(_, _) = *data_type {
+        let null_count = field_node.null_count() as usize;
+        let mut builder = ArrayData::builder(data_type.clone())
+            .len(field_node.length() as usize)
+            .buffers(buffers[1..2].to_vec())
+            .offset(0)
+            .child_data(vec![child_array.data().clone()]);
+        if null_count > 0 {
+            builder = builder.null_bit_buffer(buffers[0].clone())
+        }
+        make_array(unsafe { builder.build_unchecked() })
     } else {
-        panic!("Cannot create list array from {:?}", data_type)
+        panic!("Cannot create list or map array from {:?}", data_type)
     }
 }
 
@@ -400,7 +403,7 @@ fn create_dictionary_array(
         if null_count > 0 {
             builder = builder.null_bit_buffer(buffers[0].clone())
         }
-        make_array(builder.build())
+        make_array(unsafe { builder.build_unchecked() })
     } else {
         unreachable!("Cannot create dictionary array from {:?}", data_type)
     }
@@ -429,7 +432,7 @@ pub fn read_record_batch(
         let triple = create_array(
             field_nodes,
             field.data_type(),
-            &buf,
+            buf,
             buffers,
             dictionaries,
             node_index,
@@ -475,10 +478,10 @@ pub fn read_dictionary(
             };
             // Read a single column
             let record_batch = read_record_batch(
-                &buf,
+                buf,
                 batch.data().unwrap(),
                 Arc::new(schema),
-                &dictionaries_by_field,
+                dictionaries_by_field,
             )?;
             Some(record_batch.column(0).clone())
         }
@@ -585,13 +588,10 @@ impl<R: Read + Seek> FileReader<R> {
             let mut message_size: [u8; 4] = [0; 4];
             reader.seek(SeekFrom::Start(block.offset() as u64))?;
             reader.read_exact(&mut message_size)?;
-            let footer_len = if message_size == CONTINUATION_MARKER {
+            if message_size == CONTINUATION_MARKER {
                 reader.read_exact(&mut message_size)?;
-                i32::from_le_bytes(message_size)
-            } else {
-                i32::from_le_bytes(message_size)
-            };
-
+            }
+            let footer_len = i32::from_le_bytes(message_size);
             let mut block_data = vec![0; footer_len as usize];
 
             reader.read_exact(&mut block_data)?;
@@ -934,6 +934,7 @@ mod tests {
             "generated_interval",
             "generated_datetime",
             "generated_dictionary",
+            "generated_map",
             "generated_nested",
             "generated_primitive_no_batches",
             "generated_primitive_zerolength",
@@ -975,6 +976,7 @@ mod tests {
             "generated_interval",
             "generated_datetime",
             "generated_dictionary",
+            "generated_map",
             "generated_nested",
             "generated_null_trivial",
             "generated_null",
@@ -1002,6 +1004,7 @@ mod tests {
             "generated_interval",
             "generated_datetime",
             "generated_dictionary",
+            "generated_map",
             "generated_nested",
             "generated_primitive_no_batches",
             "generated_primitive_zerolength",
@@ -1036,6 +1039,8 @@ mod tests {
             "generated_interval",
             "generated_datetime",
             "generated_dictionary",
+            "generated_map",
+            // "generated_map_non_canonical",
             "generated_nested",
             "generated_null_trivial",
             "generated_null",
@@ -1067,6 +1072,8 @@ mod tests {
             "generated_interval",
             "generated_datetime",
             "generated_dictionary",
+            "generated_map",
+            // "generated_map_non_canonical",
             "generated_nested",
             "generated_null_trivial",
             "generated_null",

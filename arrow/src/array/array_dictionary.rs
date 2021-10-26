@@ -18,7 +18,6 @@
 use std::any::Any;
 use std::fmt;
 use std::iter::IntoIterator;
-use std::mem;
 use std::{convert::From, iter::FromIterator};
 
 use super::{
@@ -131,15 +130,17 @@ impl<T: ArrowPrimitiveType> From<ArrayData> for DictionaryArray<T> {
                 panic!("DictionaryArray's data type must match.")
             };
             // create a zero-copy of the keys' data
-            let keys = PrimitiveArray::<T>::from(ArrayData::new(
-                T::DATA_TYPE,
-                data.len(),
-                Some(data.null_count()),
-                data.null_buffer().cloned(),
-                data.offset(),
-                data.buffers().to_vec(),
-                vec![],
-            ));
+            let keys = PrimitiveArray::<T>::from(unsafe {
+                ArrayData::new_unchecked(
+                    T::DATA_TYPE,
+                    data.len(),
+                    Some(data.null_count()),
+                    data.null_buffer().cloned(),
+                    data.offset(),
+                    data.buffers().to_vec(),
+                    vec![],
+                )
+            });
             let values = make_array(data.child_data()[0].clone());
             Self {
                 data,
@@ -154,6 +155,22 @@ impl<T: ArrowPrimitiveType> From<ArrayData> for DictionaryArray<T> {
 }
 
 /// Constructs a `DictionaryArray` from an iterator of optional strings.
+///
+/// # Example:
+/// ```
+/// use arrow::array::{DictionaryArray, PrimitiveArray, StringArray};
+/// use arrow::datatypes::Int8Type;
+///
+/// let test = vec!["a", "a", "b", "c"];
+/// let array: DictionaryArray<Int8Type> = test
+///     .iter()
+///     .map(|&x| if x == "b" { None } else { Some(x) })
+///     .collect();
+/// assert_eq!(
+///     "DictionaryArray {keys: PrimitiveArray<Int8>\n[\n  0,\n  0,\n  null,\n  1,\n] values: StringArray\n[\n  \"a\",\n  \"c\",\n]}\n",
+///     format!("{:?}", array)
+/// );
+/// ```
 impl<'a, T: ArrowPrimitiveType + ArrowDictionaryKeyType> FromIterator<Option<&'a str>>
     for DictionaryArray<T>
 {
@@ -182,6 +199,20 @@ impl<'a, T: ArrowPrimitiveType + ArrowDictionaryKeyType> FromIterator<Option<&'a
 }
 
 /// Constructs a `DictionaryArray` from an iterator of strings.
+///
+/// # Example:
+///
+/// ```
+/// use arrow::array::{DictionaryArray, PrimitiveArray, StringArray};
+/// use arrow::datatypes::Int8Type;
+///
+/// let test = vec!["a", "a", "b", "c"];
+/// let array: DictionaryArray<Int8Type> = test.into_iter().collect();
+/// assert_eq!(
+///     "DictionaryArray {keys: PrimitiveArray<Int8>\n[\n  0,\n  0,\n  1,\n  2,\n] values: StringArray\n[\n  \"a\",\n  \"b\",\n  \"c\",\n]}\n",
+///     format!("{:?}", array)
+/// );
+/// ```
 impl<'a, T: ArrowPrimitiveType + ArrowDictionaryKeyType> FromIterator<&'a str>
     for DictionaryArray<T>
 {
@@ -202,24 +233,12 @@ impl<'a, T: ArrowPrimitiveType + ArrowDictionaryKeyType> FromIterator<&'a str>
 }
 
 impl<T: ArrowPrimitiveType> Array for DictionaryArray<T> {
-    fn as_any(&self) -> &Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn data(&self) -> &ArrayData {
         &self.data
-    }
-
-    fn get_buffer_memory_size(&self) -> usize {
-        // Since both `keys` and `values` derive (are references from) `data`, we only need to account for `data`.
-        self.data.get_buffer_memory_size()
-    }
-
-    fn get_array_memory_size(&self) -> usize {
-        self.data.get_array_memory_size()
-            + self.keys.get_array_memory_size()
-            + self.values.get_array_memory_size()
-            + mem::size_of_val(self)
     }
 }
 
@@ -255,7 +274,8 @@ mod tests {
             .add_buffer(Buffer::from(
                 &[10_i8, 11, 12, 13, 14, 15, 16, 17].to_byte_slice(),
             ))
-            .build();
+            .build()
+            .unwrap();
 
         // Construct a buffer for value offsets, for the nested array:
         let keys = Buffer::from(&[2_i16, 3, 4].to_byte_slice());
@@ -269,7 +289,8 @@ mod tests {
             .len(3)
             .add_buffer(keys.clone())
             .add_child_data(value_data.clone())
-            .build();
+            .build()
+            .unwrap();
         let dict_array = Int16DictionaryArray::from(dict_data);
 
         let values = dict_array.values();
@@ -288,7 +309,8 @@ mod tests {
             .offset(1)
             .add_buffer(keys)
             .add_child_data(value_data.clone())
-            .build();
+            .build()
+            .unwrap();
         let dict_array = Int16DictionaryArray::from(dict_data);
 
         let values = dict_array.values();
@@ -379,12 +401,12 @@ mod tests {
         assert_eq!(&DataType::Int32, keys.data_type());
         assert_eq!(3, keys.null_count());
 
-        assert_eq!(true, keys.is_valid(0));
-        assert_eq!(false, keys.is_valid(1));
-        assert_eq!(true, keys.is_valid(2));
-        assert_eq!(false, keys.is_valid(3));
-        assert_eq!(false, keys.is_valid(4));
-        assert_eq!(true, keys.is_valid(5));
+        assert!(keys.is_valid(0));
+        assert!(!keys.is_valid(1));
+        assert!(keys.is_valid(2));
+        assert!(!keys.is_valid(3));
+        assert!(!keys.is_valid(4));
+        assert!(keys.is_valid(5));
 
         assert_eq!(0, keys.value(0));
         assert_eq!(1, keys.value(2));

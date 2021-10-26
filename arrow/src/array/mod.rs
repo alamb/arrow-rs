@@ -87,6 +87,7 @@ mod array_binary;
 mod array_boolean;
 mod array_dictionary;
 mod array_list;
+mod array_map;
 mod array_primitive;
 mod array_string;
 mod array_struct;
@@ -122,6 +123,7 @@ pub use self::array_dictionary::DictionaryArray;
 pub use self::array_list::FixedSizeListArray;
 pub use self::array_list::LargeListArray;
 pub use self::array_list::ListArray;
+pub use self::array_map::MapArray;
 pub use self::array_primitive::PrimitiveArray;
 pub use self::array_string::LargeStringArray;
 pub use self::array_string::StringArray;
@@ -133,24 +135,188 @@ pub use self::array::make_array;
 pub use self::array::new_empty_array;
 pub use self::array::new_null_array;
 
+///
+/// # Example: Using `collect`
+/// ```
+/// # use arrow::array::Int8Array;
+/// let arr : Int8Array = [Some(1), Some(2)].into_iter().collect();
+/// ```
 pub type Int8Array = PrimitiveArray<Int8Type>;
+///
+/// # Example: Using `collect`
+/// ```
+/// # use arrow::array::Int16Array;
+/// let arr : Int16Array = [Some(1), Some(2)].into_iter().collect();
+/// ```
 pub type Int16Array = PrimitiveArray<Int16Type>;
+///
+/// # Example: Using `collect`
+/// ```
+/// # use arrow::array::Int32Array;
+/// let arr : Int32Array = [Some(1), Some(2)].into_iter().collect();
+/// ```
 pub type Int32Array = PrimitiveArray<Int32Type>;
+///
+/// # Example: Using `collect`
+/// ```
+/// # use arrow::array::Int64Array;
+/// let arr : Int64Array = [Some(1), Some(2)].into_iter().collect();
+/// ```
 pub type Int64Array = PrimitiveArray<Int64Type>;
+///
+/// # Example: Using `collect`
+/// ```
+/// # use arrow::array::UInt8Array;
+/// let arr : UInt8Array = [Some(1), Some(2)].into_iter().collect();
+/// ```
 pub type UInt8Array = PrimitiveArray<UInt8Type>;
+///
+/// # Example: Using `collect`
+/// ```
+/// # use arrow::array::UInt16Array;
+/// let arr : UInt16Array = [Some(1), Some(2)].into_iter().collect();
+/// ```
 pub type UInt16Array = PrimitiveArray<UInt16Type>;
+///
+/// # Example: Using `collect`
+/// ```
+/// # use arrow::array::UInt32Array;
+/// let arr : UInt32Array = [Some(1), Some(2)].into_iter().collect();
+/// ```
 pub type UInt32Array = PrimitiveArray<UInt32Type>;
+///
+/// # Example: Using `collect`
+/// ```
+/// # use arrow::array::UInt64Array;
+/// let arr : UInt64Array = [Some(1), Some(2)].into_iter().collect();
+/// ```
 pub type UInt64Array = PrimitiveArray<UInt64Type>;
+///
+/// # Example: Using `collect`
+/// ```
+/// # use arrow::array::Float32Array;
+/// let arr : Float32Array = [Some(1.0), Some(2.0)].into_iter().collect();
+/// ```
 pub type Float32Array = PrimitiveArray<Float32Type>;
+///
+/// # Example: Using `collect`
+/// ```
+/// # use arrow::array::Float64Array;
+/// let arr : Float64Array = [Some(1.0), Some(2.0)].into_iter().collect();
+/// ```
 pub type Float64Array = PrimitiveArray<Float64Type>;
 
+///
+/// A dictionary array where each element is a single value indexed by an integer key.
+///
+/// # Example: Using `collect`
+/// ```
+/// # use arrow::array::{Array, Int8DictionaryArray, Int8Array, StringArray};
+/// # use std::sync::Arc;
+///
+/// let array: Int8DictionaryArray = vec!["a", "a", "b", "c"].into_iter().collect();
+/// let values: Arc<dyn Array> = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+/// assert_eq!(array.keys(), &Int8Array::from(vec![0, 0, 1, 2]));
+/// assert_eq!(array.values(), &values);
+/// ```
 pub type Int8DictionaryArray = DictionaryArray<Int8Type>;
+///
+/// A dictionary array where each element is a single value indexed by an integer key.
+///
+/// # Example: Using `collect`
+/// ```
+/// # use arrow::array::{Array, Int16DictionaryArray, Int16Array, StringArray};
+/// # use std::sync::Arc;
+///
+/// let array: Int16DictionaryArray = vec!["a", "a", "b", "c"].into_iter().collect();
+/// let values: Arc<dyn Array> = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+/// assert_eq!(array.keys(), &Int16Array::from(vec![0, 0, 1, 2]));
+/// assert_eq!(array.values(), &values);
+/// ```
 pub type Int16DictionaryArray = DictionaryArray<Int16Type>;
+///
+/// A dictionary array where each element is a single value indexed by an integer key.
+///
+/// # Example: Using `collect`
+/// ```
+/// # use arrow::array::{Array, Int32DictionaryArray, Int32Array, StringArray};
+/// # use std::sync::Arc;
+///
+/// let array: Int32DictionaryArray = vec!["a", "a", "b", "c"].into_iter().collect();
+/// let values: Arc<dyn Array> = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+/// assert_eq!(array.keys(), &Int32Array::from(vec![0, 0, 1, 2]));
+/// assert_eq!(array.values(), &values);
+/// ```
 pub type Int32DictionaryArray = DictionaryArray<Int32Type>;
+///
+/// A dictionary array where each element is a single value indexed by an integer key.
+///
+/// # Example: Using `collect`
+/// ```
+/// # use arrow::array::{Array, Int64DictionaryArray, Int64Array, StringArray};
+/// # use std::sync::Arc;
+///
+/// let array: Int64DictionaryArray = vec!["a", "a", "b", "c"].into_iter().collect();
+/// let values: Arc<dyn Array> = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+/// assert_eq!(array.keys(), &Int64Array::from(vec![0, 0, 1, 2]));
+/// assert_eq!(array.values(), &values);
+/// ```
 pub type Int64DictionaryArray = DictionaryArray<Int64Type>;
+///
+/// A dictionary array where each element is a single value indexed by an integer key.
+///
+/// # Example: Using `collect`
+/// ```
+/// # use arrow::array::{Array, UInt8DictionaryArray, UInt8Array, StringArray};
+/// # use std::sync::Arc;
+///
+/// let array: UInt8DictionaryArray = vec!["a", "a", "b", "c"].into_iter().collect();
+/// let values: Arc<dyn Array> = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+/// assert_eq!(array.keys(), &UInt8Array::from(vec![0, 0, 1, 2]));
+/// assert_eq!(array.values(), &values);
+/// ```
 pub type UInt8DictionaryArray = DictionaryArray<UInt8Type>;
+///
+/// A dictionary array where each element is a single value indexed by an integer key.
+///
+/// # Example: Using `collect`
+/// ```
+/// # use arrow::array::{Array, UInt16DictionaryArray, UInt16Array, StringArray};
+/// # use std::sync::Arc;
+///
+/// let array: UInt16DictionaryArray = vec!["a", "a", "b", "c"].into_iter().collect();
+/// let values: Arc<dyn Array> = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+/// assert_eq!(array.keys(), &UInt16Array::from(vec![0, 0, 1, 2]));
+/// assert_eq!(array.values(), &values);
+/// ```
 pub type UInt16DictionaryArray = DictionaryArray<UInt16Type>;
+///
+/// A dictionary array where each element is a single value indexed by an integer key.
+///
+/// # Example: Using `collect`
+/// ```
+/// # use arrow::array::{Array, UInt32DictionaryArray, UInt32Array, StringArray};
+/// # use std::sync::Arc;
+///
+/// let array: UInt32DictionaryArray = vec!["a", "a", "b", "c"].into_iter().collect();
+/// let values: Arc<dyn Array> = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+/// assert_eq!(array.keys(), &UInt32Array::from(vec![0, 0, 1, 2]));
+/// assert_eq!(array.values(), &values);
+/// ```
 pub type UInt32DictionaryArray = DictionaryArray<UInt32Type>;
+///
+/// A dictionary array where each element is a single value indexed by an integer key.
+///
+/// # Example: Using `collect`
+/// ```
+/// # use arrow::array::{Array, UInt64DictionaryArray, UInt64Array, StringArray};
+/// # use std::sync::Arc;
+///
+/// let array: UInt64DictionaryArray = vec!["a", "a", "b", "c"].into_iter().collect();
+/// let values: Arc<dyn Array> = Arc::new(StringArray::from(vec!["a", "b", "c"]));
+/// assert_eq!(array.keys(), &UInt64Array::from(vec![0, 0, 1, 2]));
+/// assert_eq!(array.values(), &values);
+/// ```
 pub type UInt64DictionaryArray = DictionaryArray<UInt64Type>;
 
 pub type TimestampSecondArray = PrimitiveArray<TimestampSecondType>;
@@ -273,9 +439,9 @@ pub use self::ord::{build_compare, DynComparator};
 // --------------------- Array downcast helper functions ---------------------
 
 pub use self::cast::{
-    as_boolean_array, as_dictionary_array, as_generic_list_array, as_large_list_array,
-    as_largestring_array, as_list_array, as_null_array, as_primitive_array,
-    as_string_array, as_struct_array,
+    as_boolean_array, as_dictionary_array, as_generic_binary_array,
+    as_generic_list_array, as_large_list_array, as_largestring_array, as_list_array,
+    as_null_array, as_primitive_array, as_string_array, as_struct_array,
 };
 
 // ------------------------------ C Data Interface ---------------------------

@@ -44,6 +44,19 @@ const MICROSECONDS: i64 = 1_000_000;
 const NANOSECONDS: i64 = 1_000_000_000;
 
 /// Array whose elements are of primitive types.
+///
+/// # Example: From an iterator of values
+///
+/// ```
+/// use arrow::array::{Array, PrimitiveArray};
+/// use arrow::datatypes::Int32Type;
+/// let arr: PrimitiveArray<Int32Type> = PrimitiveArray::from_iter_values((0..10).map(|x| x + 1));
+/// assert_eq!(10, arr.len());
+/// assert_eq!(0, arr.null_count());
+/// for i in 0..10i32 {
+///     assert_eq!(i + 1, arr.value(i as usize));
+/// }
+/// ```
 pub struct PrimitiveArray<T: ArrowPrimitiveType> {
     /// Underlying ArrayData
     /// # Safety
@@ -101,27 +114,27 @@ impl<T: ArrowPrimitiveType> PrimitiveArray<T> {
 
     /// Returns the primitive value at index `i`.
     ///
-    /// Note this doesn't do any bound checking, for performance reason.
-    /// # Safety
-    /// caller must ensure that the passed in offset is less than the array len()
+    /// Panics of offset `i` is out of bounds
     #[inline]
     pub fn value(&self, i: usize) -> T::Native {
-        debug_assert!(i < self.len());
+        assert!(i < self.len());
         unsafe { self.value_unchecked(i) }
     }
 
     /// Creates a PrimitiveArray based on an iterator of values without nulls
     pub fn from_iter_values<I: IntoIterator<Item = T::Native>>(iter: I) -> Self {
         let val_buf: Buffer = iter.into_iter().collect();
-        let data = ArrayData::new(
-            T::DATA_TYPE,
-            val_buf.len() / mem::size_of::<<T as ArrowPrimitiveType>::Native>(),
-            None,
-            None,
-            0,
-            vec![val_buf],
-            vec![],
-        );
+        let data = unsafe {
+            ArrayData::new_unchecked(
+                T::DATA_TYPE,
+                val_buf.len() / mem::size_of::<<T as ArrowPrimitiveType>::Native>(),
+                None,
+                None,
+                0,
+                vec![val_buf],
+                vec![],
+            )
+        };
         PrimitiveArray::from(data)
     }
 
@@ -129,36 +142,28 @@ impl<T: ArrowPrimitiveType> PrimitiveArray<T> {
     pub fn from_value(value: T::Native, count: usize) -> Self {
         // # Safety: length is known
         let val_buf = unsafe { Buffer::from_trusted_len_iter((0..count).map(|_| value)) };
-        let data = ArrayData::new(
-            T::DATA_TYPE,
-            val_buf.len() / mem::size_of::<<T as ArrowPrimitiveType>::Native>(),
-            None,
-            None,
-            0,
-            vec![val_buf],
-            vec![],
-        );
+        let data = unsafe {
+            ArrayData::new_unchecked(
+                T::DATA_TYPE,
+                val_buf.len() / mem::size_of::<<T as ArrowPrimitiveType>::Native>(),
+                None,
+                None,
+                0,
+                vec![val_buf],
+                vec![],
+            )
+        };
         PrimitiveArray::from(data)
     }
 }
 
 impl<T: ArrowPrimitiveType> Array for PrimitiveArray<T> {
-    fn as_any(&self) -> &Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn data(&self) -> &ArrayData {
         &self.data
-    }
-
-    /// Returns the total number of bytes of memory occupied by the buffers owned by this [PrimitiveArray].
-    fn get_buffer_memory_size(&self) -> usize {
-        self.data.get_buffer_memory_size()
-    }
-
-    /// Returns the total number of bytes of memory occupied physically by this [PrimitiveArray].
-    fn get_array_memory_size(&self) -> usize {
-        self.data.get_array_memory_size() + mem::size_of::<RawPtrBox<T::Native>>()
     }
 }
 
@@ -244,6 +249,18 @@ where
         as_datetime::<T>(i64::from(self.value(i)))
     }
 
+    /// Returns value as a chrono `NaiveDateTime`, handling time resolution with the provided tz
+    ///
+    /// functionally it is same as `value_as_datetime`, however it adds
+    /// the passed tz to the to-be-returned NaiveDateTime
+    pub fn value_as_datetime_with_tz(
+        &self,
+        i: usize,
+        tz: FixedOffset,
+    ) -> Option<NaiveDateTime> {
+        as_datetime::<T>(i64::from(self.value(i))).map(|datetime| datetime + tz)
+    }
+
     /// Returns value as a chrono `NaiveDate` by using `Self::datetime()`
     ///
     /// If a data type cannot be converted to `NaiveDate`, a `None` is returned
@@ -309,7 +326,7 @@ impl<'a, T: ArrowPrimitiveType> IntoIterator for &'a PrimitiveArray<T> {
 impl<'a, T: ArrowPrimitiveType> PrimitiveArray<T> {
     /// constructs a new iterator
     pub fn iter(&'a self) -> PrimitiveIter<'a, T> {
-        PrimitiveIter::<'a, T>::new(&self)
+        PrimitiveIter::<'a, T>::new(self)
     }
 }
 
@@ -337,15 +354,17 @@ impl<T: ArrowPrimitiveType, Ptr: Borrow<Option<<T as ArrowPrimitiveType>::Native
             })
             .collect();
 
-        let data = ArrayData::new(
-            T::DATA_TYPE,
-            null_buf.len(),
-            None,
-            Some(null_buf.into()),
-            0,
-            vec![buffer],
-            vec![],
-        );
+        let data = unsafe {
+            ArrayData::new_unchecked(
+                T::DATA_TYPE,
+                null_buf.len(),
+                None,
+                Some(null_buf.into()),
+                0,
+                vec![buffer],
+                vec![],
+            )
+        };
         PrimitiveArray::from(data)
     }
 }
@@ -367,8 +386,15 @@ impl<T: ArrowPrimitiveType> PrimitiveArray<T> {
 
         let (null, buffer) = trusted_len_unzip(iterator);
 
-        let data =
-            ArrayData::new(T::DATA_TYPE, len, None, Some(null), 0, vec![buffer], vec![]);
+        let data = ArrayData::new_unchecked(
+            T::DATA_TYPE,
+            len,
+            None,
+            Some(null),
+            0,
+            vec![buffer],
+            vec![],
+        );
         PrimitiveArray::from(data)
     }
 }
@@ -382,8 +408,8 @@ macro_rules! def_numeric_from_vec {
             fn from(data: Vec<<$ty as ArrowPrimitiveType>::Native>) -> Self {
                 let array_data = ArrayData::builder($ty::DATA_TYPE)
                     .len(data.len())
-                    .add_buffer(Buffer::from_slice_ref(&data))
-                    .build();
+                    .add_buffer(Buffer::from_slice_ref(&data));
+                let array_data = unsafe { array_data.build_unchecked() };
                 PrimitiveArray::from(array_data)
             }
         }
@@ -433,8 +459,8 @@ impl<T: ArrowTimestampType> PrimitiveArray<T> {
         let array_data =
             ArrayData::builder(DataType::Timestamp(T::get_time_unit(), timezone))
                 .len(data.len())
-                .add_buffer(Buffer::from_slice_ref(&data))
-                .build();
+                .add_buffer(Buffer::from_slice_ref(&data));
+        let array_data = unsafe { array_data.build_unchecked() };
         PrimitiveArray::from(array_data)
     }
 }
@@ -463,8 +489,8 @@ impl<T: ArrowTimestampType> PrimitiveArray<T> {
             ArrayData::builder(DataType::Timestamp(T::get_time_unit(), timezone))
                 .len(data_len)
                 .add_buffer(val_buf.into())
-                .null_bit_buffer(null_buf.into())
-                .build();
+                .null_bit_buffer(null_buf.into());
+        let array_data = unsafe { array_data.build_unchecked() };
         PrimitiveArray::from(array_data)
     }
 }
@@ -508,9 +534,6 @@ mod tests {
             assert!(arr.is_valid(i));
             assert_eq!(i as i32, arr.value(i));
         }
-
-        assert_eq!(64, arr.get_buffer_memory_size());
-        assert_eq!(136, arr.get_array_memory_size());
     }
 
     #[test]
@@ -530,9 +553,6 @@ mod tests {
                 assert!(!arr.is_valid(i));
             }
         }
-
-        assert_eq!(128, arr.get_buffer_memory_size());
-        assert_eq!(216, arr.get_array_memory_size());
     }
 
     #[test]
@@ -777,19 +797,19 @@ mod tests {
 
         let bool_arr = arr2.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        assert_eq!(false, bool_arr.is_valid(0));
+        assert!(!bool_arr.is_valid(0));
 
-        assert_eq!(true, bool_arr.is_valid(1));
-        assert_eq!(true, bool_arr.value(1));
+        assert!(bool_arr.is_valid(1));
+        assert!(bool_arr.value(1));
 
-        assert_eq!(true, bool_arr.is_valid(2));
-        assert_eq!(false, bool_arr.value(2));
+        assert!(bool_arr.is_valid(2));
+        assert!(!bool_arr.value(2));
 
-        assert_eq!(true, bool_arr.is_valid(3));
-        assert_eq!(true, bool_arr.value(3));
+        assert!(bool_arr.is_valid(3));
+        assert!(bool_arr.value(3));
 
-        assert_eq!(true, bool_arr.is_valid(4));
-        assert_eq!(false, bool_arr.value(4));
+        assert!(bool_arr.is_valid(4));
+        assert!(!bool_arr.value(4));
     }
 
     #[test]
@@ -880,7 +900,8 @@ mod tests {
             .len(5)
             .offset(2)
             .add_buffer(buf)
-            .build();
+            .build()
+            .unwrap();
         let arr = Int32Array::from(data);
         assert_eq!(buf2, arr.data.buffers()[0]);
         assert_eq!(5, arr.len());
@@ -929,7 +950,7 @@ mod tests {
     #[should_panic(expected = "PrimitiveArray data should contain a single buffer only \
                                (values buffer)")]
     fn test_primitive_array_invalid_buffer_len() {
-        let data = ArrayData::builder(DataType::Int32).len(5).build();
+        let data = ArrayData::builder(DataType::Int32).len(5).build().unwrap();
         Int32Array::from(data);
     }
 

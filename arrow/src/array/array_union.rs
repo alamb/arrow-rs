@@ -15,64 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Contains the `UnionArray` type.
-//!
-//! Each slot in a `UnionArray` can have a value chosen from a number of types.  Each of the
-//! possible types are named like the fields of a [`StructArray`](crate::array::StructArray).
-//! A `UnionArray` can have two possible memory layouts, "dense" or "sparse".  For more information
-//! on please see the [specification](https://arrow.apache.org/docs/format/Columnar.html#union-layout).
-//!
-//! Builders are provided for `UnionArray`'s involving primitive types.  `UnionArray`'s of nested
-//! types are also supported but not via `UnionBuilder`, see the tests for examples.
-//!
-//! # Example: Dense Memory Layout
-//!
-//! ```
-//! use arrow::array::UnionBuilder;
-//! use arrow::datatypes::{Float64Type, Int32Type};
-//!
-//! # fn main() -> arrow::error::Result<()> {
-//! let mut builder = UnionBuilder::new_dense(3);
-//! builder.append::<Int32Type>("a", 1).unwrap();
-//! builder.append::<Float64Type>("b", 3.0).unwrap();
-//! builder.append::<Int32Type>("a", 4).unwrap();
-//! let union = builder.build().unwrap();
-//!
-//! assert_eq!(union.type_id(0), 0_i8);
-//! assert_eq!(union.type_id(1), 1_i8);
-//! assert_eq!(union.type_id(2), 0_i8);
-//!
-//! assert_eq!(union.value_offset(0), 0_i32);
-//! assert_eq!(union.value_offset(1), 0_i32);
-//! assert_eq!(union.value_offset(2), 1_i32);
-//!
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! # Example: Sparse Memory Layout
-//! ```
-//! use arrow::array::UnionBuilder;
-//! use arrow::datatypes::{Float64Type, Int32Type};
-//!
-//! # fn main() -> arrow::error::Result<()> {
-//! let mut builder = UnionBuilder::new_sparse(3);
-//! builder.append::<Int32Type>("a", 1).unwrap();
-//! builder.append::<Float64Type>("b", 3.0).unwrap();
-//! builder.append::<Int32Type>("a", 4).unwrap();
-//! let union = builder.build().unwrap();
-//!
-//! assert_eq!(union.type_id(0), 0_i8);
-//! assert_eq!(union.type_id(1), 1_i8);
-//! assert_eq!(union.type_id(2), 0_i8);
-//!
-//! assert_eq!(union.value_offset(0), 0_i32);
-//! assert_eq!(union.value_offset(1), 1_i32);
-//! assert_eq!(union.value_offset(2), 2_i32);
-//!
-//! # Ok(())
-//! # }
-//! ```
+/// Contains the `UnionArray` type.
+///
 use crate::array::{data::count_nulls, make_array, Array, ArrayData, ArrayRef};
 use crate::buffer::Buffer;
 use crate::datatypes::*;
@@ -80,10 +24,18 @@ use crate::error::{ArrowError, Result};
 
 use core::fmt;
 use std::any::Any;
-use std::mem;
 use std::mem::size_of;
 
 /// An Array that can represent slots of varying types.
+///
+/// Each slot in a `UnionArray` can have a value chosen from a number of types.  Each of the
+/// possible types are named like the fields of a [`StructArray`](crate::array::StructArray).
+/// A `UnionArray` can have two possible memory layouts, "dense" or "sparse".  For more information
+/// on please see the [specification](https://arrow.apache.org/docs/format/Columnar.html#union-layout).
+///
+/// [`UnionBuilder`]can be used to create  `UnionArray`'s of primitive types.  `UnionArray`'s of nested
+/// types are also supported but not via `UnionBuilder`, see the tests for examples.
+///
 pub struct UnionArray {
     data: ArrayData,
     boxed_fields: Vec<ArrayRef>,
@@ -130,9 +82,11 @@ impl UnionArray {
         if let Some(bitmap) = bitmap_data {
             builder = builder.null_bit_buffer(bitmap)
         }
-        let data = match value_offsets {
-            Some(b) => builder.add_buffer(b).build(),
-            None => builder.build(),
+        let data = unsafe {
+            match value_offsets {
+                Some(b) => builder.add_buffer(b).build_unchecked(),
+                None => builder.build_unchecked(),
+            }
         };
         Self::from(data)
     }
@@ -269,31 +223,12 @@ impl From<ArrayData> for UnionArray {
 }
 
 impl Array for UnionArray {
-    fn as_any(&self) -> &Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn data(&self) -> &ArrayData {
         &self.data
-    }
-
-    /// Returns the total number of bytes of memory occupied by the buffers owned by this [UnionArray].
-    fn get_buffer_memory_size(&self) -> usize {
-        let mut size = self.data.get_buffer_memory_size();
-        for field in &self.boxed_fields {
-            size += field.get_buffer_memory_size();
-        }
-        size
-    }
-
-    /// Returns the total number of bytes of memory occupied physically by this [UnionArray].
-    fn get_array_memory_size(&self) -> usize {
-        let mut size = self.data.get_array_memory_size();
-        size += mem::size_of_val(self) - mem::size_of_val(&self.boxed_fields);
-        for field in &self.boxed_fields {
-            size += field.get_array_memory_size();
-        }
-        size
     }
 }
 
@@ -390,7 +325,7 @@ mod tests {
 
         assert_eq!(expected_array_values.len(), union.len());
         for (i, expected_value) in expected_array_values.iter().enumerate() {
-            assert_eq!(false, union.is_null(i));
+            assert!(!union.is_null(i));
             let slot = union.value(i);
             let slot = slot.as_any().downcast_ref::<Int32Array>().unwrap();
             assert_eq!(slot.len(), 1);
@@ -412,7 +347,7 @@ mod tests {
         assert_eq!(5, union.len());
         for i in 0..union.len() {
             let slot = union.value(i);
-            assert_eq!(false, union.is_null(i));
+            assert!(!union.is_null(i));
             match i {
                 0 => {
                     let slot = slot.as_any().downcast_ref::<Int32Array>().unwrap();
@@ -465,21 +400,21 @@ mod tests {
             match i {
                 0 => {
                     let slot = slot.as_any().downcast_ref::<Int32Array>().unwrap();
-                    assert_eq!(false, union.is_null(i));
+                    assert!(!union.is_null(i));
                     assert_eq!(slot.len(), 1);
                     let value = slot.value(0);
                     assert_eq!(1_i32, value);
                 }
                 1 => {
                     let slot = slot.as_any().downcast_ref::<Int64Array>().unwrap();
-                    assert_eq!(false, union.is_null(i));
+                    assert!(!union.is_null(i));
                     assert_eq!(slot.len(), 1);
                     let value = slot.value(0);
                     assert_eq!(3_i64, value);
                 }
                 2 => {
                     let slot = slot.as_any().downcast_ref::<Int32Array>().unwrap();
-                    assert_eq!(false, union.is_null(i));
+                    assert!(!union.is_null(i));
                     assert_eq!(slot.len(), 1);
                     let value = slot.value(0);
                     assert_eq!(10_i32, value);
@@ -487,7 +422,7 @@ mod tests {
                 3 => assert!(union.is_null(i)),
                 4 => {
                     let slot = slot.as_any().downcast_ref::<Int32Array>().unwrap();
-                    assert_eq!(false, union.is_null(i));
+                    assert!(!union.is_null(i));
                     assert_eq!(slot.len(), 1);
                     let value = slot.value(0);
                     assert_eq!(6_i32, value);
@@ -516,7 +451,7 @@ mod tests {
             match i {
                 0 => {
                     let slot = slot.as_any().downcast_ref::<Int32Array>().unwrap();
-                    assert_eq!(false, union.is_null(i));
+                    assert!(!union.is_null(i));
                     assert_eq!(slot.len(), 1);
                     let value = slot.value(0);
                     assert_eq!(10_i32, value);
@@ -524,7 +459,7 @@ mod tests {
                 1 => assert!(new_union.is_null(i)),
                 2 => {
                     let slot = slot.as_any().downcast_ref::<Int32Array>().unwrap();
-                    assert_eq!(false, union.is_null(i));
+                    assert!(!union.is_null(i));
                     assert_eq!(slot.len(), 1);
                     let value = slot.value(0);
                     assert_eq!(6_i32, value);
@@ -546,7 +481,7 @@ mod tests {
         let type_id_buffer = Buffer::from_slice_ref(&type_ids);
         let value_offsets_buffer = Buffer::from_slice_ref(&value_offsets);
 
-        let mut children: Vec<(Field, Arc<Array>)> = Vec::new();
+        let mut children: Vec<(Field, Arc<dyn Array>)> = Vec::new();
         children.push((
             Field::new("A", DataType::Utf8, false),
             Arc::new(string_array),
@@ -666,7 +601,7 @@ mod tests {
 
         assert_eq!(expected_array_values.len(), union.len());
         for (i, expected_value) in expected_array_values.iter().enumerate() {
-            assert_eq!(false, union.is_null(i));
+            assert!(!union.is_null(i));
             let slot = union.value(i);
             let slot = slot.as_any().downcast_ref::<Int32Array>().unwrap();
             assert_eq!(slot.len(), 1);
@@ -701,7 +636,7 @@ mod tests {
 
         for i in 0..union.len() {
             let slot = union.value(i);
-            assert_eq!(false, union.is_null(i));
+            assert!(!union.is_null(i));
             match i {
                 0 => {
                     let slot = slot.as_any().downcast_ref::<Int32Array>().unwrap();
@@ -766,7 +701,7 @@ mod tests {
             match i {
                 0 => {
                     let slot = slot.as_any().downcast_ref::<Int32Array>().unwrap();
-                    assert_eq!(false, union.is_null(i));
+                    assert!(!union.is_null(i));
                     assert_eq!(slot.len(), 1);
                     let value = slot.value(0);
                     assert_eq!(1_i32, value);
@@ -774,14 +709,14 @@ mod tests {
                 1 => assert!(union.is_null(i)),
                 2 => {
                     let slot = slot.as_any().downcast_ref::<Float64Array>().unwrap();
-                    assert_eq!(false, union.is_null(i));
+                    assert!(!union.is_null(i));
                     assert_eq!(slot.len(), 1);
                     let value = slot.value(0);
                     assert!(value - 3_f64 < f64::EPSILON);
                 }
                 3 => {
                     let slot = slot.as_any().downcast_ref::<Int32Array>().unwrap();
-                    assert_eq!(false, union.is_null(i));
+                    assert!(!union.is_null(i));
                     assert_eq!(slot.len(), 1);
                     let value = slot.value(0);
                     assert_eq!(4_i32, value);
@@ -811,7 +746,7 @@ mod tests {
                 0 => assert!(new_union.is_null(i)),
                 1 => {
                     let slot = slot.as_any().downcast_ref::<Float64Array>().unwrap();
-                    assert_eq!(false, new_union.is_null(i));
+                    assert!(!new_union.is_null(i));
                     assert_eq!(slot.len(), 1);
                     let value = slot.value(0);
                     assert!(value - 3_f64 < f64::EPSILON);
@@ -819,7 +754,7 @@ mod tests {
                 2 => assert!(new_union.is_null(i)),
                 3 => {
                     let slot = slot.as_any().downcast_ref::<Int32Array>().unwrap();
-                    assert_eq!(false, new_union.is_null(i));
+                    assert!(!new_union.is_null(i));
                     assert_eq!(slot.len(), 1);
                     let value = slot.value(0);
                     assert_eq!(4_i32, value);

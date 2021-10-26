@@ -17,7 +17,6 @@
 
 use std::any::Any;
 use std::fmt;
-use std::mem;
 
 use num::Num;
 
@@ -50,6 +49,9 @@ impl OffsetSizeTrait for i64 {
     }
 }
 
+/// Generic struct for a primitive Array
+///
+/// For non generic lists, you may wish to consider using [`ListArray`] or [`LargeListArray`]`
 pub struct GenericListArray<OffsetSize> {
     data: ArrayData,
     values: ArrayRef,
@@ -108,7 +110,7 @@ impl<OffsetSize: OffsetSizeTrait> GenericListArray<OffsetSize> {
 
     /// constructs a new iterator
     pub fn iter<'a>(&'a self) -> GenericListArrayIter<'a, OffsetSize> {
-        GenericListArrayIter::<'a, OffsetSize>::new(&self)
+        GenericListArrayIter::<'a, OffsetSize>::new(self)
     }
 
     #[inline]
@@ -180,13 +182,14 @@ impl<OffsetSize: OffsetSizeTrait> GenericListArray<OffsetSize> {
         } else {
             DataType::List(field)
         };
-        let data = ArrayData::builder(data_type)
+        let array_data = ArrayData::builder(data_type)
             .len(null_buf.len())
             .add_buffer(offsets.into())
             .add_child_data(values.data().clone())
-            .null_bit_buffer(null_buf.into())
-            .build();
-        Self::from(data)
+            .null_bit_buffer(null_buf.into());
+        let array_data = unsafe { array_data.build_unchecked() };
+
+        Self::from(array_data)
     }
 }
 
@@ -251,22 +254,12 @@ impl<OffsetSize: OffsetSizeTrait> GenericListArray<OffsetSize> {
 }
 
 impl<OffsetSize: 'static + OffsetSizeTrait> Array for GenericListArray<OffsetSize> {
-    fn as_any(&self) -> &Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn data(&self) -> &ArrayData {
         &self.data
-    }
-
-    /// Returns the total number of bytes of memory occupied by the buffers owned by this [ListArray].
-    fn get_buffer_memory_size(&self) -> usize {
-        self.data.get_buffer_memory_size()
-    }
-
-    /// Returns the total number of bytes of memory occupied physically by this [ListArray].
-    fn get_array_memory_size(&self) -> usize {
-        self.data.get_array_memory_size() + mem::size_of_val(self)
     }
 }
 
@@ -284,14 +277,73 @@ impl<OffsetSize: OffsetSizeTrait> fmt::Debug for GenericListArray<OffsetSize> {
 
 /// A list array where each element is a variable-sized sequence of values with the same
 /// type whose memory offsets between elements are represented by a i32.
+///
+/// # Example
+///
+/// ```
+///     # use arrow::array::{Array, ListArray, Int32Array};
+///     # use arrow::datatypes::{DataType, Int32Type};
+///     let data = vec![
+///        Some(vec![Some(0), Some(1), Some(2)]),
+///        None,
+///        Some(vec![Some(3), None, Some(5), Some(19)]),
+///        Some(vec![Some(6), Some(7)]),
+///     ];
+///     let list_array = ListArray::from_iter_primitive::<Int32Type, _, _>(data);
+///     assert_eq!(DataType::Int32, list_array.value_type());
+///     assert_eq!(4, list_array.len());
+///     assert_eq!(1, list_array.null_count());
+///     assert_eq!(3, list_array.value_length(0));
+///     assert_eq!(0, list_array.value_length(1));
+///     assert_eq!(4, list_array.value_length(2));
+///     assert_eq!(
+///         19,
+///         list_array
+///         .value(2)
+///         .as_any()
+///         .downcast_ref::<Int32Array>()
+///         .unwrap()
+///         .value(3)
+///     )
+/// ```
 pub type ListArray = GenericListArray<i32>;
 
 /// A list array where each element is a variable-sized sequence of values with the same
 /// type whose memory offsets between elements are represented by a i64.
+/// # Example
+///
+/// ```
+///     # use arrow::array::{Array, LargeListArray, Int64Array};
+///     # use arrow::datatypes::{DataType, Int64Type};
+///     let data = vec![
+///        Some(vec![Some(0), Some(1), Some(2)]),
+///        None,
+///        Some(vec![Some(3), None, Some(5), Some(19)]),
+///        Some(vec![Some(6), Some(7)]),
+///     ];
+///     let list_array = LargeListArray::from_iter_primitive::<Int64Type, _, _>(data);
+///     assert_eq!(DataType::Int64, list_array.value_type());
+///     assert_eq!(4, list_array.len());
+///     assert_eq!(1, list_array.null_count());
+///     assert_eq!(3, list_array.value_length(0));
+///     assert_eq!(0, list_array.value_length(1));
+///     assert_eq!(4, list_array.value_length(2));
+///     assert_eq!(
+///         19,
+///         list_array
+///         .value(2)
+///         .as_any()
+///         .downcast_ref::<Int64Array>()
+///         .unwrap()
+///         .value(3)
+///     )
+/// ```
 pub type LargeListArray = GenericListArray<i64>;
 
 /// A list array where each element is a fixed-size sequence of values with the same
 /// type whose maximum length is represented by a i32.
+///
+/// For non generic lists, you may wish to consider using [`FixedSizeBinaryArray`]
 pub struct FixedSizeListArray {
     data: ArrayData,
     values: ArrayRef,
@@ -377,24 +429,12 @@ impl From<ArrayData> for FixedSizeListArray {
 }
 
 impl Array for FixedSizeListArray {
-    fn as_any(&self) -> &Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn data(&self) -> &ArrayData {
         &self.data
-    }
-
-    /// Returns the total number of bytes of memory occupied by the buffers owned by this [FixedSizeListArray].
-    fn get_buffer_memory_size(&self) -> usize {
-        self.data.get_buffer_memory_size() + self.values().get_buffer_memory_size()
-    }
-
-    /// Returns the total number of bytes of memory occupied physically by this [FixedSizeListArray].
-    fn get_array_memory_size(&self) -> usize {
-        self.data.get_array_memory_size()
-            + self.values().get_array_memory_size()
-            + mem::size_of_val(self)
     }
 }
 
@@ -427,7 +467,8 @@ mod tests {
         let value_data = ArrayData::builder(DataType::Int32)
             .len(8)
             .add_buffer(Buffer::from(&[0, 1, 2, 3, 4, 5, 6, 7].to_byte_slice()))
-            .build();
+            .build()
+            .unwrap();
 
         // Construct a buffer for value offsets, for the nested array:
         //  [[0, 1, 2], [3, 4, 5], [6, 7]]
@@ -440,7 +481,8 @@ mod tests {
             .len(3)
             .add_buffer(value_offsets)
             .add_child_data(value_data)
-            .build();
+            .build()
+            .unwrap();
         ListArray::from(list_data)
     }
 
@@ -463,7 +505,8 @@ mod tests {
         let value_data = ArrayData::builder(DataType::Int32)
             .len(8)
             .add_buffer(Buffer::from_slice_ref(&[0, 1, 2, 3, 4, 5, 6, 7]))
-            .build();
+            .build()
+            .unwrap();
 
         // Construct a buffer for value offsets, for the nested array:
         //  [[0, 1, 2], [3, 4, 5], [6, 7]]
@@ -476,7 +519,8 @@ mod tests {
             .len(3)
             .add_buffer(value_offsets.clone())
             .add_child_data(value_data.clone())
-            .build();
+            .build()
+            .unwrap();
         let list_array = ListArray::from(list_data);
 
         let values = list_array.values();
@@ -514,7 +558,8 @@ mod tests {
             .offset(1)
             .add_buffer(value_offsets)
             .add_child_data(value_data.clone())
-            .build();
+            .build()
+            .unwrap();
         let list_array = ListArray::from(list_data);
 
         let values = list_array.values();
@@ -549,7 +594,8 @@ mod tests {
         let value_data = ArrayData::builder(DataType::Int32)
             .len(8)
             .add_buffer(Buffer::from_slice_ref(&[0, 1, 2, 3, 4, 5, 6, 7]))
-            .build();
+            .build()
+            .unwrap();
 
         // Construct a buffer for value offsets, for the nested array:
         //  [[0, 1, 2], [3, 4, 5], [6, 7]]
@@ -562,7 +608,8 @@ mod tests {
             .len(3)
             .add_buffer(value_offsets.clone())
             .add_child_data(value_data.clone())
-            .build();
+            .build()
+            .unwrap();
         let list_array = LargeListArray::from(list_data);
 
         let values = list_array.values();
@@ -600,7 +647,8 @@ mod tests {
             .offset(1)
             .add_buffer(value_offsets)
             .add_child_data(value_data.clone())
-            .build();
+            .build()
+            .unwrap();
         let list_array = LargeListArray::from(list_data);
 
         let values = list_array.values();
@@ -635,7 +683,8 @@ mod tests {
         let value_data = ArrayData::builder(DataType::Int32)
             .len(9)
             .add_buffer(Buffer::from_slice_ref(&[0, 1, 2, 3, 4, 5, 6, 7, 8]))
-            .build();
+            .build()
+            .unwrap();
 
         // Construct a list array from the above two
         let list_data_type = DataType::FixedSizeList(
@@ -645,7 +694,8 @@ mod tests {
         let list_data = ArrayData::builder(list_data_type.clone())
             .len(3)
             .add_child_data(value_data.clone())
-            .build();
+            .build()
+            .unwrap();
         let list_array = FixedSizeListArray::from(list_data);
 
         let values = list_array.values();
@@ -674,7 +724,8 @@ mod tests {
             .len(3)
             .offset(1)
             .add_child_data(value_data.clone())
-            .build();
+            .build()
+            .unwrap();
         let list_array = FixedSizeListArray::from(list_data);
 
         let values = list_array.values();
@@ -704,7 +755,8 @@ mod tests {
         let value_data = ArrayData::builder(DataType::Int32)
             .len(8)
             .add_buffer(Buffer::from_slice_ref(&[0, 1, 2, 3, 4, 5, 6, 7]))
-            .build();
+            .build()
+            .unwrap();
 
         // Construct a list array from the above two
         let list_data_type = DataType::FixedSizeList(
@@ -714,7 +766,8 @@ mod tests {
         let list_data = ArrayData::builder(list_data_type)
             .len(3)
             .add_child_data(value_data)
-            .build();
+            .build()
+            .unwrap();
         FixedSizeListArray::from(list_data);
     }
 
@@ -724,7 +777,8 @@ mod tests {
         let value_data = ArrayData::builder(DataType::Int32)
             .len(10)
             .add_buffer(Buffer::from_slice_ref(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]))
-            .build();
+            .build()
+            .unwrap();
 
         // Construct a buffer for value offsets, for the nested array:
         //  [[0, 1], null, null, [2, 3], [4, 5], null, [6, 7, 8], null, [9]]
@@ -745,7 +799,8 @@ mod tests {
             .add_buffer(value_offsets)
             .add_child_data(value_data.clone())
             .null_bit_buffer(Buffer::from(null_bits))
-            .build();
+            .build()
+            .unwrap();
         let list_array = ListArray::from(list_data);
 
         let values = list_array.values();
@@ -786,7 +841,8 @@ mod tests {
         let value_data = ArrayData::builder(DataType::Int32)
             .len(10)
             .add_buffer(Buffer::from_slice_ref(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]))
-            .build();
+            .build()
+            .unwrap();
 
         // Construct a buffer for value offsets, for the nested array:
         //  [[0, 1], null, null, [2, 3], [4, 5], null, [6, 7, 8], null, [9]]
@@ -807,7 +863,8 @@ mod tests {
             .add_buffer(value_offsets)
             .add_child_data(value_data.clone())
             .null_bit_buffer(Buffer::from(null_bits))
-            .build();
+            .build()
+            .unwrap();
         let list_array = LargeListArray::from(list_data);
 
         let values = list_array.values();
@@ -851,7 +908,8 @@ mod tests {
         let value_data = ArrayData::builder(DataType::Int32)
             .len(10)
             .add_buffer(Buffer::from_slice_ref(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]))
-            .build();
+            .build()
+            .unwrap();
 
         // Construct a buffer for value offsets, for the nested array:
         //  [[0, 1], null, null, [2, 3], [4, 5], null, [6, 7, 8], null, [9]]
@@ -872,7 +930,8 @@ mod tests {
             .add_buffer(value_offsets)
             .add_child_data(value_data)
             .null_bit_buffer(Buffer::from(null_bits))
-            .build();
+            .build()
+            .unwrap();
         let list_array = LargeListArray::from(list_data);
         assert_eq!(9, list_array.len());
 
@@ -885,7 +944,8 @@ mod tests {
         let value_data = ArrayData::builder(DataType::Int32)
             .len(10)
             .add_buffer(Buffer::from_slice_ref(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]))
-            .build();
+            .build()
+            .unwrap();
 
         // Set null buts for the nested array:
         //  [[0, 1], null, null, [6, 7], [8, 9]]
@@ -904,7 +964,8 @@ mod tests {
             .len(5)
             .add_child_data(value_data.clone())
             .null_bit_buffer(Buffer::from(null_bits))
-            .build();
+            .build()
+            .unwrap();
         let list_array = FixedSizeListArray::from(list_data);
 
         let values = list_array.values();
@@ -945,7 +1006,8 @@ mod tests {
         let value_data = ArrayData::builder(DataType::Int32)
             .len(10)
             .add_buffer(Buffer::from_slice_ref(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]))
-            .build();
+            .build()
+            .unwrap();
 
         // Set null buts for the nested array:
         //  [[0, 1], null, null, [6, 7], [8, 9]]
@@ -964,7 +1026,8 @@ mod tests {
             .len(5)
             .add_child_data(value_data)
             .null_bit_buffer(Buffer::from(null_bits))
-            .build();
+            .build()
+            .unwrap();
         let list_array = FixedSizeListArray::from(list_data);
 
         list_array.value(10);
@@ -978,13 +1041,15 @@ mod tests {
         let value_data = ArrayData::builder(DataType::Int32)
             .len(8)
             .add_buffer(Buffer::from_slice_ref(&[0, 1, 2, 3, 4, 5, 6, 7]))
-            .build();
+            .build()
+            .unwrap();
         let list_data_type =
             DataType::List(Box::new(Field::new("item", DataType::Int32, false)));
         let list_data = ArrayData::builder(list_data_type)
             .len(3)
             .add_child_data(value_data)
-            .build();
+            .build()
+            .unwrap();
         ListArray::from(list_data);
     }
 
@@ -999,7 +1064,8 @@ mod tests {
         let list_data = ArrayData::builder(list_data_type)
             .len(3)
             .add_buffer(value_offsets)
-            .build();
+            .build()
+            .unwrap();
         ListArray::from(list_data);
     }
 
@@ -1009,7 +1075,8 @@ mod tests {
         let value_data = ArrayData::builder(DataType::Int32)
             .len(8)
             .add_buffer(Buffer::from_slice_ref(&[0, 1, 2, 3, 4, 5, 6, 7]))
-            .build();
+            .build()
+            .unwrap();
 
         let value_offsets = Buffer::from_slice_ref(&[2, 2, 5, 7]);
 
@@ -1019,7 +1086,8 @@ mod tests {
             .len(3)
             .add_buffer(value_offsets)
             .add_child_data(value_data)
-            .build();
+            .build()
+            .unwrap();
         ListArray::from(list_data);
     }
 
@@ -1029,7 +1097,10 @@ mod tests {
         let ptr = alloc::allocate_aligned::<u8>(8);
         let buf = unsafe { Buffer::from_raw_parts(ptr, 8, 8) };
         let buf2 = buf.slice(1);
-        let array_data = ArrayData::builder(DataType::Int32).add_buffer(buf2).build();
+        let array_data = ArrayData::builder(DataType::Int32)
+            .add_buffer(buf2)
+            .build()
+            .unwrap();
         Int32Array::from(array_data);
     }
 
@@ -1043,14 +1114,88 @@ mod tests {
         let values: [i32; 8] = [0; 8];
         let value_data = ArrayData::builder(DataType::Int32)
             .add_buffer(Buffer::from_slice_ref(&values))
-            .build();
+            .build()
+            .unwrap();
 
         let list_data_type =
             DataType::List(Box::new(Field::new("item", DataType::Int32, false)));
         let list_data = ArrayData::builder(list_data_type)
             .add_buffer(buf2)
             .add_child_data(value_data)
-            .build();
+            .build()
+            .unwrap();
         ListArray::from(list_data);
+    }
+
+    #[test]
+    fn list_array_equality() {
+        // test scaffold
+        fn do_comparison(
+            lhs_data: Vec<Option<Vec<Option<i32>>>>,
+            rhs_data: Vec<Option<Vec<Option<i32>>>>,
+            should_equal: bool,
+        ) {
+            let lhs = ListArray::from_iter_primitive::<Int32Type, _, _>(lhs_data.clone());
+            let rhs = ListArray::from_iter_primitive::<Int32Type, _, _>(rhs_data.clone());
+            assert_eq!(lhs == rhs, should_equal);
+
+            let lhs = LargeListArray::from_iter_primitive::<Int32Type, _, _>(lhs_data);
+            let rhs = LargeListArray::from_iter_primitive::<Int32Type, _, _>(rhs_data);
+            assert_eq!(lhs == rhs, should_equal);
+        }
+
+        do_comparison(
+            vec![
+                Some(vec![Some(0), Some(1), Some(2)]),
+                None,
+                Some(vec![Some(3), None, Some(5)]),
+                Some(vec![Some(6), Some(7)]),
+            ],
+            vec![
+                Some(vec![Some(0), Some(1), Some(2)]),
+                None,
+                Some(vec![Some(3), None, Some(5)]),
+                Some(vec![Some(6), Some(7)]),
+            ],
+            true,
+        );
+
+        do_comparison(
+            vec![
+                None,
+                None,
+                Some(vec![Some(3), None, Some(5)]),
+                Some(vec![Some(6), Some(7)]),
+            ],
+            vec![
+                Some(vec![Some(0), Some(1), Some(2)]),
+                None,
+                Some(vec![Some(3), None, Some(5)]),
+                Some(vec![Some(6), Some(7)]),
+            ],
+            false,
+        );
+
+        do_comparison(
+            vec![
+                None,
+                None,
+                Some(vec![Some(3), None, Some(5)]),
+                Some(vec![Some(6), Some(7)]),
+            ],
+            vec![
+                None,
+                None,
+                Some(vec![Some(3), None, Some(5)]),
+                Some(vec![Some(0), Some(0)]),
+            ],
+            false,
+        );
+
+        do_comparison(
+            vec![None, None, Some(vec![Some(1)])],
+            vec![None, None, Some(vec![Some(2)])],
+            false,
+        );
     }
 }

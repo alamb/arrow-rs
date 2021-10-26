@@ -22,6 +22,7 @@ use std::mem;
 use std::sync::Arc;
 
 use crate::datatypes::{DataType, IntervalUnit};
+use crate::error::Result;
 use crate::{bitmap::Bitmap, datatypes::ArrowNativeType};
 use crate::{
     buffer::{Buffer, MutableBuffer},
@@ -126,7 +127,7 @@ pub(crate) fn new_buffers(data_type: &DataType, capacity: usize) -> [MutableBuff
             buffer.push(0i64);
             [buffer, MutableBuffer::new(capacity * mem::size_of::<u8>())]
         }
-        DataType::List(_) => {
+        DataType::List(_) | DataType::Map(_, _) => {
             // offset buffer always starts with a zero
             let mut buffer = MutableBuffer::new((1 + capacity) * mem::size_of::<i32>());
             buffer.push(0i32);
@@ -239,7 +240,20 @@ pub struct ArrayData {
 pub type ArrayDataRef = Arc<ArrayData>;
 
 impl ArrayData {
-    pub fn new(
+    /// Create a new ArrayData instance;
+    ///
+    /// If `null_count` is not specified, the number of nulls in
+    /// null_bit_buffer is calculated
+    ///
+    /// # Safety
+    ///
+    /// The input values *must* form a valid Arrow array for
+    /// `data_type`, or undefined behavior can results.
+    ///
+    /// Note: This is a low level API and most users of the arrow
+    /// crate should create arrays using the methods in the `array`
+    /// module.
+    pub unsafe fn new_unchecked(
         data_type: DataType,
         len: usize,
         null_count: Option<usize>,
@@ -262,6 +276,53 @@ impl ArrayData {
             child_data,
             null_bitmap,
         }
+    }
+
+    /// Create a new ArrayData, validating that the provided buffers
+    /// form a valid Arrow array of the specified data type.
+    ///
+    /// If `null_count` is not specified, the number of nulls in
+    /// null_bit_buffer is calculated
+    ///
+    /// Note: This is a low level API and most users of the arrow
+    /// crate should create arrays using the methods in the `array`
+    /// module.
+    pub fn try_new(
+        data_type: DataType,
+        len: usize,
+        null_count: Option<usize>,
+        null_bit_buffer: Option<Buffer>,
+        offset: usize,
+        buffers: Vec<Buffer>,
+        child_data: Vec<ArrayData>,
+    ) -> Result<Self> {
+        // Safetly justification: `validate` is (will be) called below
+        let new_self = unsafe {
+            Self::new_unchecked(
+                data_type,
+                len,
+                null_count,
+                null_bit_buffer,
+                offset,
+                buffers,
+                child_data,
+            )
+        };
+
+        new_self.validate()?;
+        Ok(new_self)
+    }
+
+    /// Validates that buffers in this ArrayData are sufficiently
+    /// sized, to store `len` + `offset` total elements of
+    /// `data_type`.
+    ///
+    /// This check is "cheap" in the sense that it does not validate the
+    /// contents of the buffers (e.g. that string offsets for UTF8 arrays
+    /// are within the length of the buffer).
+    pub fn validate(&self) -> Result<()> {
+        // will be filled in a subsequent PR
+        Ok(())
     }
 
     /// Returns a builder to construct a `ArrayData` instance.
@@ -354,20 +415,18 @@ impl ArrayData {
 
     /// Returns the total number of bytes of memory occupied physically by this [ArrayData].
     pub fn get_array_memory_size(&self) -> usize {
-        let mut size = 0;
-        // Calculate size of the fields that don't have [get_array_memory_size] method internally.
-        size += mem::size_of_val(self)
-            - mem::size_of_val(&self.buffers)
-            - mem::size_of_val(&self.null_bitmap)
-            - mem::size_of_val(&self.child_data);
+        let mut size = mem::size_of_val(self);
 
         // Calculate rest of the fields top down which contain actual data
         for buffer in &self.buffers {
-            size += mem::size_of_val(&buffer);
+            size += mem::size_of::<Buffer>();
             size += buffer.capacity();
         }
         if let Some(bitmap) = &self.null_bitmap {
-            size += bitmap.get_array_memory_size()
+            // this includes the size of the bitmap struct itself, since it is stored directly in
+            // this struct we already counted those bytes in the size_of_val(self) above
+            size += bitmap.get_array_memory_size();
+            size -= mem::size_of::<Bitmap>();
         }
         for child in &self.child_data {
             size += child.get_array_memory_size();
@@ -385,15 +444,36 @@ impl ArrayData {
     pub fn slice(&self, offset: usize, length: usize) -> ArrayData {
         assert!((offset + length) <= self.len());
 
-        let mut new_data = self.clone();
+        if let DataType::Struct(_) = self.data_type() {
+            // Slice into children
+            let new_offset = self.offset + offset;
+            let new_data = ArrayData {
+                data_type: self.data_type().clone(),
+                len: length,
+                null_count: count_nulls(self.null_buffer(), new_offset, length),
+                offset: new_offset,
+                buffers: self.buffers.clone(),
+                // Slice child data, to propagate offsets down to them
+                child_data: self
+                    .child_data()
+                    .iter()
+                    .map(|data| data.slice(offset, length))
+                    .collect(),
+                null_bitmap: self.null_bitmap().clone(),
+            };
 
-        new_data.len = length;
-        new_data.offset = offset + self.offset;
+            new_data
+        } else {
+            let mut new_data = self.clone();
 
-        new_data.null_count =
-            count_nulls(new_data.null_buffer(), new_data.offset, new_data.len);
+            new_data.len = length;
+            new_data.offset = offset + self.offset;
 
-        new_data
+            new_data.null_count =
+                count_nulls(new_data.null_buffer(), new_data.offset, new_data.len);
+
+            new_data
+        }
     }
 
     /// Returns the `buffer` as a slice of type `T` starting at self.offset
@@ -456,6 +536,9 @@ impl ArrayData {
                 .iter()
                 .map(|field| Self::new_empty(field.data_type()))
                 .collect(),
+            DataType::Map(field, _) => {
+                vec![Self::new_empty(field.data_type())]
+            }
             DataType::Union(_) => unimplemented!(),
             DataType::Dictionary(_, data_type) => {
                 vec![Self::new_empty(data_type)]
@@ -463,7 +546,18 @@ impl ArrayData {
             DataType::Float16 => unreachable!(),
         };
 
-        Self::new(data_type.clone(), 0, Some(0), None, 0, buffers, child_data)
+        // Data was constructed correctly above
+        unsafe {
+            Self::new_unchecked(
+                data_type.clone(),
+                0,
+                Some(0),
+                None,
+                0,
+                buffers,
+                child_data,
+            )
+        }
     }
 }
 
@@ -542,8 +636,27 @@ impl ArrayDataBuilder {
         self
     }
 
-    pub fn build(self) -> ArrayData {
-        ArrayData::new(
+    /// Creates an array data, without any validation
+    ///
+    /// # Safety
+    ///
+    /// The same caveats as [`ArrayData::new_unchecked`]
+    /// apply.
+    pub unsafe fn build_unchecked(self) -> ArrayData {
+        ArrayData::new_unchecked(
+            self.data_type,
+            self.len,
+            self.null_count,
+            self.null_bit_buffer,
+            self.offset,
+            self.buffers,
+            self.child_data,
+        )
+    }
+
+    /// Creates an array data, validating all inputs
+    pub fn build(self) -> Result<ArrayData> {
+        ArrayData::try_new(
             self.data_type,
             self.len,
             self.null_count,
@@ -565,7 +678,8 @@ mod tests {
     #[test]
     fn test_new() {
         let arr_data =
-            ArrayData::new(DataType::Boolean, 10, Some(1), None, 2, vec![], vec![]);
+            ArrayData::try_new(DataType::Boolean, 10, Some(1), None, 2, vec![], vec![])
+                .unwrap();
         assert_eq!(10, arr_data.len());
         assert_eq!(1, arr_data.null_count());
         assert_eq!(2, arr_data.offset());
@@ -575,7 +689,7 @@ mod tests {
 
     #[test]
     fn test_builder() {
-        let child_arr_data = ArrayData::new(
+        let child_arr_data = ArrayData::try_new(
             DataType::Int32,
             5,
             Some(0),
@@ -583,7 +697,8 @@ mod tests {
             0,
             vec![Buffer::from_slice_ref(&[1i32, 2, 3, 4, 5])],
             vec![],
-        );
+        )
+        .unwrap();
         let v = vec![0, 1, 2, 3];
         let b1 = Buffer::from(&v[..]);
         let arr_data = ArrayData::builder(DataType::Int32)
@@ -594,7 +709,8 @@ mod tests {
                 0b01011111, 0b10110101, 0b01100011, 0b00011110,
             ]))
             .add_child_data(child_arr_data.clone())
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(20, arr_data.len());
         assert_eq!(10, arr_data.null_count());
@@ -614,7 +730,8 @@ mod tests {
         let arr_data = ArrayData::builder(DataType::Int32)
             .len(16)
             .null_bit_buffer(Buffer::from(bit_v))
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(13, arr_data.null_count());
 
         // Test with offset
@@ -626,7 +743,8 @@ mod tests {
             .len(12)
             .offset(2)
             .null_bit_buffer(Buffer::from(bit_v))
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(10, arr_data.null_count());
     }
 
@@ -639,7 +757,8 @@ mod tests {
         let arr_data = ArrayData::builder(DataType::Int32)
             .len(16)
             .null_bit_buffer(Buffer::from(bit_v))
-            .build();
+            .build()
+            .unwrap();
         assert!(arr_data.null_buffer().is_some());
         assert_eq!(&bit_v, arr_data.null_buffer().unwrap().as_slice());
     }
@@ -653,7 +772,8 @@ mod tests {
         let data = ArrayData::builder(DataType::Int32)
             .len(16)
             .null_bit_buffer(Buffer::from(bit_v))
-            .build();
+            .build()
+            .unwrap();
         let new_data = data.slice(1, 15);
         assert_eq!(data.len() - 1, new_data.len());
         assert_eq!(1, new_data.offset());
@@ -668,8 +788,8 @@ mod tests {
 
     #[test]
     fn test_equality() {
-        let int_data = ArrayData::builder(DataType::Int32).build();
-        let float_data = ArrayData::builder(DataType::Float32).build();
+        let int_data = ArrayData::builder(DataType::Int32).build().unwrap();
+        let float_data = ArrayData::builder(DataType::Float32).build().unwrap();
         assert_ne!(int_data, float_data);
     }
 

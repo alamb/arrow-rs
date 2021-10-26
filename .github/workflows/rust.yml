@@ -46,7 +46,7 @@ jobs:
           # these represent dependencies downloaded by cargo
           # and thus do not depend on the OS, arch nor rust version.
           path: /github/home/.cargo
-          key: cargo-cache-
+          key: cargo-cache2-
       - name: Cache Rust dependencies
         uses: actions/cache@v2
         with:
@@ -91,7 +91,7 @@ jobs:
         with:
           path: /github/home/.cargo
           # this key equals the ones on `linux-build-lib` for re-use
-          key: cargo-cache-
+          key: cargo-cache2-
       - name: Cache Rust dependencies
         uses: actions/cache@v2
         with:
@@ -118,6 +118,11 @@ jobs:
           cargo run --example dynamic_types
           cargo run --example read_csv
           cargo run --example read_csv_infer_schema
+          # Exit arrow directory
+          cd ..
+          (cd parquet && cargo check --no-default-features)
+          (cd arrow && cargo check --no-default-features)
+          (cd arrow-flight && cargo check --no-default-features)
 
   # test the --features "simd" of the arrow crate. This requires nightly.
   linux-test-simd:
@@ -126,7 +131,7 @@ jobs:
     strategy:
       matrix:
         arch: [amd64]
-        rust: [nightly-2021-03-24]
+        rust: [nightly]
     container:
       image: ${{ matrix.arch }}/rust
       env:
@@ -143,7 +148,7 @@ jobs:
         with:
           path: /github/home/.cargo
           # this key equals the ones on `linux-build-lib` for re-use
-          key: cargo-cache-
+          key: cargo-cache2-
       - name: Cache Rust dependencies
         uses: actions/cache@v2
         with:
@@ -161,6 +166,12 @@ jobs:
           export CARGO_TARGET_DIR="/github/home/target"
           cd arrow
           cargo test --features "simd"
+      - name: Check new project build with simd features
+        run: |
+          export CARGO_HOME="/github/home/.cargo"
+          export CARGO_TARGET_DIR="/github/home/target"
+          cd arrow/test/dependency/simd
+          cargo check
 
   windows-and-macos:
     name: Test on ${{ matrix.os }} Rust ${{ matrix.rust }}
@@ -212,7 +223,7 @@ jobs:
         with:
           path: /github/home/.cargo
           # this key equals the ones on `linux-build-lib` for re-use
-          key: cargo-cache-
+          key: cargo-cache2-
       - name: Cache Rust dependencies
         uses: actions/cache@v2
         with:
@@ -228,7 +239,7 @@ jobs:
         run: |
           export CARGO_HOME="/github/home/.cargo"
           export CARGO_TARGET_DIR="/github/home/target"
-          cargo clippy --all-targets --workspace -- -D warnings -A clippy::redundant_field_names
+          cargo clippy --features test_common --all-targets --workspace -- -D warnings -A clippy::redundant_field_names
 
   lint:
     name: Lint
@@ -244,6 +255,7 @@ jobs:
           rustup component add rustfmt
       - name: Run
         run: cargo fmt --all -- --check
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
@@ -275,59 +287,11 @@ jobs:
           export ARROW_TEST_DATA=$(pwd)/testing/data
           export PARQUET_TEST_DATA=$(pwd)/parquet-testing/data
 
-          # 2020-11-15: There is a cargo-tarpaulin regression in 0.17.0
-          # see https://github.com/xd009642/tarpaulin/issues/618
-          cargo install --version 0.16.0 cargo-tarpaulin
-          cargo tarpaulin --out Xml
+          cargo install --version 0.18.2 cargo-tarpaulin
+          cargo tarpaulin --all --out Xml
       - name: Report coverage
         continue-on-error: true
         run: bash <(curl -s https://codecov.io/bash)
-
-  # test FFI against the C-Data interface exposed by pyarrow
-  pyarrow-integration-test:
-    name: Test Pyarrow C Data Interface
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        rust: [stable]
-    steps:
-      - uses: actions/checkout@v2
-        with:
-          submodules: true
-      - name: Setup Rust toolchain
-        run: |
-          rustup toolchain install ${{ matrix.rust }}
-          rustup default ${{ matrix.rust }}
-          rustup component add rustfmt clippy
-      - name: Cache Cargo
-        uses: actions/cache@v2
-        with:
-          path: /home/runner/.cargo
-          key: cargo-maturin-cache-
-      - name: Cache Rust dependencies
-        uses: actions/cache@v2
-        with:
-          path: /home/runner/target
-          # this key is not equal because maturin uses different compilation flags.
-          key: ${{ runner.os }}-${{ matrix.arch }}-target-maturin-cache-${{ matrix.rust }}-
-      - uses: actions/setup-python@v2
-        with:
-          python-version: '3.7'
-      - name: Install Python dependencies
-        run: python -m pip install --upgrade pip setuptools wheel
-      - name: Run tests
-        run: |
-          export CARGO_HOME="/home/runner/.cargo"
-          export CARGO_TARGET_DIR="/home/runner/target"
-
-          cd arrow-pyarrow-integration-testing
-
-          python -m venv venv
-          source venv/bin/activate
-
-          pip install maturin==0.8.2 toml==0.10.1 pyarrow==1.0.0
-          maturin develop
-          python -m unittest discover tests
 
   # test the arrow crate builds against wasm32 in stable rust
   wasm32-build:
@@ -336,7 +300,7 @@ jobs:
     strategy:
       matrix:
         arch: [amd64]
-        rust: [nightly-2021-03-24]
+        rust: [nightly]
     container:
       image: ${{ matrix.arch }}/rust
       env:
@@ -354,7 +318,7 @@ jobs:
         with:
           path: /github/home/.cargo
           # this key equals the ones on `linux-build-lib` for re-use
-          key: cargo-cache-
+          key: cargo-cache2-
       - name: Cache Rust dependencies
         uses: actions/cache@v2
         with:
@@ -366,16 +330,18 @@ jobs:
           rustup override set ${{ matrix.rust }}
           rustup component add rustfmt
           rustup target add wasm32-unknown-unknown
+          rustup target add wasm32-wasi
       - name: Build arrow crate
         run: |
           export CARGO_HOME="/github/home/.cargo"
           export CARGO_TARGET_DIR="/github/home/target"
           cd arrow
-          cargo build --target wasm32-unknown-unknown
+          cargo build --no-default-features --features=csv,ipc,simd --target wasm32-unknown-unknown
+          cargo build --no-default-features --features=csv,ipc,simd --target wasm32-wasi
 
-  # test the projects can build without default features
+  # test builds with various feature flag combinations outside the main workspace
   default-build:
-    name: Check No Defaults on AMD64 Rust ${{ matrix.rust }}
+    name: Feature Flag Builds ${{ matrix.rust }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -384,34 +350,42 @@ jobs:
     container:
       image: ${{ matrix.arch }}/rust
       env:
-        # Disable full debug symbol generation to speed up CI build and keep memory down
-        # "1" means line tables only, which is useful for panic tracebacks.
-        RUSTFLAGS: "-C debuginfo=1"
-        ARROW_TEST_DATA: /__w/arrow-rs/arrow-rs/testing/data
-        PARQUET_TEST_DATA: /__w/arrow/arrow/parquet-testing/data
+        # Disable debug symbol generation to speed up CI build and keep memory down
+        RUSTFLAGS: "-C debuginfo=0"
     steps:
       - uses: actions/checkout@v2
-        with:
-          submodules: true
       - name: Cache Cargo
         uses: actions/cache@v2
         with:
           path: /github/home/.cargo
           # this key equals the ones on `linux-build-lib` for re-use
-          key: cargo-cache-
+          key: cargo-cache2-
       - name: Cache Rust dependencies
         uses: actions/cache@v2
         with:
           path: /github/home/target
-          key: ${{ runner.os }}-${{ matrix.arch }}-target-wasm32-cache-${{ matrix.rust }}
+          # this key equals the ones on `linux-build-lib` for re-use
+          key: ${{ runner.os }}-${{ matrix.arch }}-target-cache-${{ matrix.rust }}
       - name: Setup Rust toolchain
         run: |
           rustup toolchain install ${{ matrix.rust }}
           rustup override set ${{ matrix.rust }}
           rustup component add rustfmt
-      - name: Build arrow crate
+      - name: Arrow Build with default features
         run: |
           export CARGO_HOME="/github/home/.cargo"
           export CARGO_TARGET_DIR="/github/home/target"
-          cd arrow
-          cargo check --all-targets --no-default-features
+          cd arrow/test/dependency/default-features
+          cargo check
+      - name: Arrow Build with default-features=false
+        run: |
+          export CARGO_HOME="/github/home/.cargo"
+          export CARGO_TARGET_DIR="/github/home/target"
+          cd arrow/test/dependency/no-default-features
+          cargo check
+      - name: Parquet Derive build with default-features
+        run: |
+          export CARGO_HOME="/github/home/.cargo"
+          export CARGO_TARGET_DIR="/github/home/target"
+          cd parquet_derive/test/dependency/default-features
+          cargo check

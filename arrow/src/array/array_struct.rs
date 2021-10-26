@@ -19,7 +19,6 @@ use std::any::Any;
 use std::convert::{From, TryFrom};
 use std::fmt;
 use std::iter::IntoIterator;
-use std::mem;
 
 use super::{make_array, Array, ArrayData, ArrayRef};
 use crate::datatypes::DataType;
@@ -31,6 +30,32 @@ use crate::{
 
 /// A nested array type where each child (called *field*) is represented by a separate
 /// array.
+/// # Example: Create an array from a vector of fields
+///
+/// ```
+/// use std::sync::Arc;
+/// use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, StructArray};
+/// use arrow::datatypes::{DataType, Field};
+///
+/// let boolean = Arc::new(BooleanArray::from(vec![false, false, true, true]));
+/// let int = Arc::new(Int32Array::from(vec![42, 28, 19, 31]));
+///
+/// let struct_array = StructArray::from(vec![
+///     (
+///         Field::new("b", DataType::Boolean, false),
+///         boolean.clone() as ArrayRef,
+///     ),
+///     (
+///         Field::new("c", DataType::Int32, false),
+///         int.clone() as ArrayRef,
+///     ),
+/// ]);
+/// assert_eq!(struct_array.column(0).as_ref(), boolean.as_ref());
+/// assert_eq!(struct_array.column(1).as_ref(), int.as_ref());
+/// assert_eq!(4, struct_array.len());
+/// assert_eq!(0, struct_array.null_count());
+/// assert_eq!(0, struct_array.offset());
+/// ```
 pub struct StructArray {
     data: ArrayData,
     pub(crate) boxed_fields: Vec<ArrayRef>,
@@ -85,12 +110,7 @@ impl From<ArrayData> for StructArray {
     fn from(data: ArrayData) -> Self {
         let mut boxed_fields = vec![];
         for cd in data.child_data() {
-            let child_data = if data.offset() != 0 || data.len() != cd.len() {
-                cd.slice(data.offset(), data.len())
-            } else {
-                cd.clone()
-            };
-            boxed_fields.push(make_array(child_data));
+            boxed_fields.push(make_array(cd.clone()));
         }
         Self { data, boxed_fields }
     }
@@ -161,12 +181,14 @@ impl TryFrom<Vec<(&str, ArrayRef)>> for StructArray {
             builder = builder.null_bit_buffer(null_buffer);
         }
 
-        Ok(StructArray::from(builder.build()))
+        let array_data = unsafe { builder.build_unchecked() };
+
+        Ok(StructArray::from(array_data))
     }
 }
 
 impl Array for StructArray {
-    fn as_any(&self) -> &Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
@@ -177,16 +199,6 @@ impl Array for StructArray {
     /// Returns the length (i.e., number of elements) of this array
     fn len(&self) -> usize {
         self.data_ref().len()
-    }
-
-    /// Returns the total number of bytes of memory occupied by the buffers owned by this [StructArray].
-    fn get_buffer_memory_size(&self) -> usize {
-        self.data.get_buffer_memory_size()
-    }
-
-    /// Returns the total number of bytes of memory occupied physically by this [StructArray].
-    fn get_array_memory_size(&self) -> usize {
-        self.data.get_array_memory_size() + mem::size_of_val(self)
     }
 }
 
@@ -209,11 +221,11 @@ impl From<Vec<(Field, ArrayRef)>> for StructArray {
             )
         }
 
-        let data = ArrayData::builder(DataType::Struct(field_types))
+        let array_data = ArrayData::builder(DataType::Struct(field_types))
             .child_data(field_values.into_iter().map(|a| a.data().clone()).collect())
-            .len(length)
-            .build();
-        Self::from(data)
+            .len(length);
+        let array_data = unsafe { array_data.build_unchecked() };
+        Self::from(array_data)
     }
 }
 
@@ -255,12 +267,12 @@ impl From<(Vec<(Field, ArrayRef)>, Buffer)> for StructArray {
             )
         }
 
-        let data = ArrayData::builder(DataType::Struct(field_types))
+        let array_data = ArrayData::builder(DataType::Struct(field_types))
             .null_bit_buffer(pair.1)
             .child_data(field_values.into_iter().map(|a| a.data().clone()).collect())
-            .len(length)
-            .build();
-        Self::from(data)
+            .len(length);
+        let array_data = unsafe { array_data.build_unchecked() };
+        Self::from(array_data)
     }
 }
 
@@ -295,7 +307,8 @@ mod tests {
             .len(4)
             .add_child_data(boolean_data.clone())
             .add_child_data(int_data.clone())
-            .build();
+            .build()
+            .unwrap();
         let struct_array = StructArray::from(struct_array_data);
 
         assert_eq!(boolean_data, struct_array.column(0).data());
@@ -354,36 +367,18 @@ mod tests {
             .null_bit_buffer(Buffer::from(&[9_u8]))
             .add_buffer(Buffer::from(&[0, 3, 3, 3, 7].to_byte_slice()))
             .add_buffer(Buffer::from(b"joemark"))
-            .build();
+            .build()
+            .unwrap();
 
         let expected_int_data = ArrayData::builder(DataType::Int32)
             .len(4)
             .null_bit_buffer(Buffer::from(&[11_u8]))
             .add_buffer(Buffer::from(&[1, 2, 0, 4].to_byte_slice()))
-            .build();
+            .build()
+            .unwrap();
 
-        assert_eq!(&expected_string_data, arr.column(0).data());
-
-        // TODO: implement equality for ArrayData
-        assert_eq!(expected_int_data.len(), arr.column(1).data().len());
-        assert_eq!(
-            expected_int_data.null_count(),
-            arr.column(1).data().null_count()
-        );
-        assert_eq!(
-            expected_int_data.null_bitmap(),
-            arr.column(1).data().null_bitmap()
-        );
-        let expected_value_buf = expected_int_data.buffers()[0].clone();
-        let actual_value_buf = arr.column(1).data().buffers()[0].clone();
-        for i in 0..expected_int_data.len() {
-            if !expected_int_data.is_null(i) {
-                assert_eq!(
-                    expected_value_buf.as_slice()[i * 4..(i + 1) * 4],
-                    actual_value_buf.as_slice()[i * 4..(i + 1) * 4]
-                );
-            }
-        }
+        assert_eq!(expected_string_data, *arr.column(0).data());
+        assert_eq!(expected_int_data, *arr.column(1).data());
     }
 
     #[test]
@@ -417,7 +412,7 @@ mod tests {
             (
                 Field::new("b", DataType::Int16, false),
                 Arc::new(BooleanArray::from(vec![false, false, true, true]))
-                    as Arc<Array>,
+                    as Arc<dyn Array>,
             ),
             (
                 Field::new("c", DataType::Utf8, false),
@@ -432,12 +427,14 @@ mod tests {
             .len(5)
             .add_buffer(Buffer::from([0b00010000]))
             .null_bit_buffer(Buffer::from([0b00010001]))
-            .build();
+            .build()
+            .unwrap();
         let int_data = ArrayData::builder(DataType::Int32)
             .len(5)
             .add_buffer(Buffer::from([0, 28, 42, 0, 0].to_byte_slice()))
             .null_bit_buffer(Buffer::from([0b00000110]))
-            .build();
+            .build()
+            .unwrap();
 
         let mut field_types = vec![];
         field_types.push(Field::new("a", DataType::Boolean, false));
@@ -447,7 +444,8 @@ mod tests {
             .add_child_data(boolean_data.clone())
             .add_child_data(int_data.clone())
             .null_bit_buffer(Buffer::from([0b00010111]))
-            .build();
+            .build()
+            .unwrap();
         let struct_array = StructArray::from(struct_array_data);
 
         assert_eq!(5, struct_array.len());
@@ -465,12 +463,12 @@ mod tests {
         assert_eq!(5, c0.len());
         assert_eq!(3, c0.null_count());
         assert!(c0.is_valid(0));
-        assert_eq!(false, c0.value(0));
+        assert!(!c0.value(0));
         assert!(c0.is_null(1));
         assert!(c0.is_null(2));
         assert!(c0.is_null(3));
         assert!(c0.is_valid(4));
-        assert_eq!(true, c0.value(4));
+        assert!(c0.value(4));
 
         let c1 = struct_array.column(1);
         let c1 = c1.as_any().downcast_ref::<Int32Array>().unwrap();
@@ -500,7 +498,7 @@ mod tests {
         assert!(sliced_c0.is_null(0));
         assert!(sliced_c0.is_null(1));
         assert!(sliced_c0.is_valid(2));
-        assert_eq!(true, sliced_c0.value(2));
+        assert!(sliced_c0.value(2));
 
         let sliced_c1 = sliced_array.column(1);
         let sliced_c1 = sliced_c1.as_any().downcast_ref::<Int32Array>().unwrap();
@@ -520,7 +518,7 @@ mod tests {
         StructArray::from(vec![
             (
                 Field::new("b", DataType::Float32, false),
-                Arc::new(Float32Array::from(vec![1.1])) as Arc<Array>,
+                Arc::new(Float32Array::from(vec![1.1])) as Arc<dyn Array>,
             ),
             (
                 Field::new("c", DataType::Float64, false),

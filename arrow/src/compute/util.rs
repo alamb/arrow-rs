@@ -48,9 +48,9 @@ pub(super) fn combine_option_bitmap(
             None => Ok(Some(l.bit_slice(left_offset_in_bits, len_in_bits))),
 
             Some(r) => Ok(Some(buffer_bin_and(
-                &l,
+                l,
                 left_offset_in_bits,
-                &r,
+                r,
                 right_offset_in_bits,
                 len_in_bits,
             ))),
@@ -82,9 +82,9 @@ pub(super) fn compare_option_bitmap(
             None => Ok(Some(l.bit_slice(left_offset_in_bits, len_in_bits))),
 
             Some(r) => Ok(Some(buffer_bin_or(
-                &l,
+                l,
                 left_offset_in_bits,
-                &r,
+                r,
                 right_offset_in_bits,
                 len_in_bits,
             ))),
@@ -185,15 +185,18 @@ pub(super) mod tests {
         null_bit_buffer: Option<Buffer>,
     ) -> Arc<ArrayData> {
         // empty vec for buffers and children is not really correct, but for these tests we only care about the null bitmap
-        Arc::new(ArrayData::new(
-            DataType::UInt8,
-            len,
-            None,
-            null_bit_buffer,
-            offset,
-            vec![],
-            vec![],
-        ))
+        Arc::new(
+            ArrayData::try_new(
+                DataType::UInt8,
+                len,
+                None,
+                null_bit_buffer,
+                offset,
+                vec![],
+                vec![],
+            )
+            .unwrap(),
+        )
     }
 
     #[test]
@@ -333,7 +336,8 @@ pub(super) mod tests {
             .null_bit_buffer(list_bitmap.into())
             .add_buffer(value_offsets)
             .add_child_data(value_data)
-            .build();
+            .build()
+            .unwrap();
 
         GenericListArray::<S>::from(list_data)
     }
@@ -397,7 +401,8 @@ pub(super) mod tests {
             .len(list_len)
             .null_bit_buffer(list_bitmap.into())
             .add_child_data(child_data)
-            .build();
+            .build()
+            .unwrap();
 
         FixedSizeListArray::from(list_data)
     }

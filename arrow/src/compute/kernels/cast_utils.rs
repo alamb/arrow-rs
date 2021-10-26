@@ -95,7 +95,7 @@ pub fn string_to_timestamp_nanos(s: &str) -> Result<i64> {
 
     // without a timezone specifier as a local time, using T as a separator
     // Example: 2020-09-08T13:42:29.190855
-    if let Ok(ts) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S.%f") {
+    if let Ok(ts) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
         return naive_datetime_to_timestamp(s, ts);
     }
 
@@ -108,7 +108,7 @@ pub fn string_to_timestamp_nanos(s: &str) -> Result<i64> {
 
     // without a timezone specifier as a local time, using ' ' as a separator
     // Example: 2020-09-08 13:42:29.190855
-    if let Ok(ts) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S.%f") {
+    if let Ok(ts) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
         return naive_datetime_to_timestamp(s, ts);
     }
 
@@ -209,7 +209,7 @@ mod tests {
         // Note: Use chrono APIs that are different than
         // naive_datetime_to_timestamp to compute the utc offset to
         // try and double check the logic
-        let utc_offset_secs = match Local.offset_from_local_datetime(&naive_datetime) {
+        let utc_offset_secs = match Local.offset_from_local_datetime(naive_datetime) {
             LocalResult::Single(local_offset) => {
                 local_offset.fix().local_minus_utc() as i64
             }
@@ -227,7 +227,7 @@ mod tests {
         // somewhat suceptable to bugs in the use of chrono
         let naive_datetime = NaiveDateTime::new(
             NaiveDate::from_ymd(2020, 9, 8),
-            NaiveTime::from_hms_nano(13, 42, 29, 190855),
+            NaiveTime::from_hms_nano(13, 42, 29, 190855000),
         );
 
         // Ensure both T and ' ' variants work

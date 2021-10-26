@@ -23,7 +23,7 @@ on:
 
 jobs:
 
-  docker:
+  integration:
     name: Integration Test
     runs-on: ubuntu-latest
     steps:
@@ -46,3 +46,51 @@ jobs:
         run: pip install -e dev/archery[docker]
       - name: Execute Docker Build
         run: archery docker run -e ARCHERY_INTEGRATION_WITH_RUST=1 conda-integration
+
+  # test FFI against the C-Data interface exposed by pyarrow
+  pyarrow-integration-test:
+    name: Test Pyarrow C Data Interface
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust: [stable]
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          submodules: true
+      - name: Setup Rust toolchain
+        run: |
+          rustup toolchain install ${{ matrix.rust }}
+          rustup default ${{ matrix.rust }}
+          rustup component add rustfmt clippy
+      - name: Cache Cargo
+        uses: actions/cache@v2
+        with:
+          path: /home/runner/.cargo
+          key: cargo-maturin-cache-
+      - name: Cache Rust dependencies
+        uses: actions/cache@v2
+        with:
+          path: /home/runner/target
+          # this key is not equal because maturin uses different compilation flags.
+          key: ${{ runner.os }}-${{ matrix.arch }}-target-maturin-cache-${{ matrix.rust }}-
+      - uses: actions/setup-python@v2
+        with:
+          python-version: '3.7'
+      - name: Upgrade pip and setuptools
+        run: pip install --upgrade pip setuptools wheel virtualenv
+      - name: Create virtualenv and install dependencies
+        run: |
+          virtualenv venv
+          source venv/bin/activate
+          pip install maturin toml pytest pytz pyarrow>=5.0
+      - name: Run tests
+        env:
+          CARGO_HOME: "/home/runner/.cargo"
+          CARGO_TARGET_DIR: "/home/runner/target"
+        run: |
+          source venv/bin/activate
+          pushd arrow-pyarrow-integration-testing
+          maturin develop
+          pytest -v .
+          popd

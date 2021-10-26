@@ -77,7 +77,7 @@ macro_rules! downcast_dict_take {
 /// # }
 /// ```
 pub fn take<IndexType>(
-    values: &Array,
+    values: &dyn Array,
     indices: &PrimitiveArray<IndexType>,
     options: Option<TakeOptions>,
 ) -> Result<ArrayRef>
@@ -89,7 +89,7 @@ where
 }
 
 fn take_impl<IndexType>(
-    values: &Array,
+    values: &dyn Array,
     indices: &PrimitiveArray<IndexType>,
     options: Option<TakeOptions>,
 ) -> Result<ArrayRef>
@@ -231,9 +231,22 @@ where
                 .map(|a| take_impl(a.as_ref(), indices, Some(options.clone())))
                 .collect();
             let arrays = arrays?;
-            let pairs: Vec<(Field, ArrayRef)> =
+            let fields: Vec<(Field, ArrayRef)> =
                 fields.clone().into_iter().zip(arrays).collect();
-            Ok(Arc::new(StructArray::from(pairs)) as ArrayRef)
+
+            // Create the null bit buffer.
+            let is_valid: Buffer = indices
+                .iter()
+                .map(|index| {
+                    if let Some(index) = index {
+                        struct_.is_valid(ArrowNativeType::to_usize(&index).unwrap())
+                    } else {
+                        false
+                    }
+                })
+                .collect();
+
+            Ok(Arc::new(StructArray::from((fields, is_valid))) as ArrayRef)
         }
         DataType::Dictionary(key_type, _) => match key_type.as_ref() {
             DataType::Int8 => downcast_dict_take!(Int8Type, values, indices),
@@ -246,6 +259,27 @@ where
             DataType::UInt64 => downcast_dict_take!(UInt64Type, values, indices),
             t => unimplemented!("Take not supported for dictionary key type {:?}", t),
         },
+        DataType::Binary => {
+            let values = values
+                .as_any()
+                .downcast_ref::<GenericBinaryArray<i32>>()
+                .unwrap();
+            Ok(Arc::new(take_binary(values, indices)?))
+        }
+        DataType::LargeBinary => {
+            let values = values
+                .as_any()
+                .downcast_ref::<GenericBinaryArray<i64>>()
+                .unwrap();
+            Ok(Arc::new(take_binary(values, indices)?))
+        }
+        DataType::FixedSizeBinary(_) => {
+            let values = values
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap();
+            Ok(Arc::new(take_fixed_size_binary(values, indices)?))
+        }
         t => unimplemented!("Take not supported for data type {:?}", t),
     }
 }
@@ -268,20 +302,17 @@ impl Default for TakeOptions {
 }
 
 #[inline(always)]
-fn maybe_usize<I: ArrowPrimitiveType>(index: I::Native) -> Result<usize> {
+fn maybe_usize<I: ArrowNativeType>(index: I) -> Result<usize> {
     index
         .to_usize()
         .ok_or_else(|| ArrowError::ComputeError("Cast to usize failed".to_string()))
 }
 
 // take implementation when neither values nor indices contain nulls
-fn take_no_nulls<T, I>(
-    values: &[T::Native],
-    indices: &[I::Native],
-) -> Result<(Buffer, Option<Buffer>)>
+fn take_no_nulls<T, I>(values: &[T], indices: &[I]) -> Result<(Buffer, Option<Buffer>)>
 where
-    T: ArrowPrimitiveType,
-    I: ArrowNumericType,
+    T: ArrowNativeType,
+    I: ArrowNativeType,
 {
     let values = indices
         .iter()
@@ -295,27 +326,36 @@ where
 // take implementation when only values contain nulls
 fn take_values_nulls<T, I>(
     values: &PrimitiveArray<T>,
-    indices: &[I::Native],
+    indices: &[I],
 ) -> Result<(Buffer, Option<Buffer>)>
 where
     T: ArrowPrimitiveType,
-    I: ArrowNumericType,
-    I::Native: ToPrimitive,
+    I: ArrowNativeType,
+{
+    take_values_nulls_inner(values.data(), values.values(), indices)
+}
+
+fn take_values_nulls_inner<T, I>(
+    values_data: &ArrayData,
+    values: &[T],
+    indices: &[I],
+) -> Result<(Buffer, Option<Buffer>)>
+where
+    T: ArrowNativeType,
+    I: ArrowNativeType,
 {
     let num_bytes = bit_util::ceil(indices.len(), 8);
     let mut nulls = MutableBuffer::new(num_bytes).with_bitset(num_bytes, true);
     let null_slice = nulls.as_slice_mut();
     let mut null_count = 0;
 
-    let values_values = values.values();
-
     let values = indices.iter().enumerate().map(|(i, index)| {
         let index = maybe_usize::<I>(*index)?;
-        if values.is_null(index) {
+        if values_data.is_null(index) {
             null_count += 1;
             bit_util::unset_bit(null_slice, i);
         }
-        Result::Ok(values_values[index])
+        Result::Ok(values[index])
     });
     // Soundness: `slice.map` is `TrustedLen`.
     let buffer = unsafe { Buffer::try_from_trusted_len_iter(values)? };
@@ -332,21 +372,33 @@ where
 
 // take implementation when only indices contain nulls
 fn take_indices_nulls<T, I>(
-    values: &[T::Native],
+    values: &[T],
     indices: &PrimitiveArray<I>,
 ) -> Result<(Buffer, Option<Buffer>)>
 where
-    T: ArrowPrimitiveType,
+    T: ArrowNativeType,
     I: ArrowNumericType,
     I::Native: ToPrimitive,
 {
-    let values = indices.values().iter().map(|index| {
+    take_indices_nulls_inner(values, indices.values(), indices.data())
+}
+
+fn take_indices_nulls_inner<T, I>(
+    values: &[T],
+    indices: &[I],
+    indices_data: &ArrayData,
+) -> Result<(Buffer, Option<Buffer>)>
+where
+    T: ArrowNativeType,
+    I: ArrowNativeType,
+{
+    let values = indices.iter().map(|index| {
         let index = maybe_usize::<I>(*index)?;
         Result::Ok(match values.get(index) {
             Some(value) => *value,
             None => {
-                if indices.is_null(index) {
-                    T::Native::default()
+                if indices_data.is_null(index) {
+                    T::default()
                 } else {
                     panic!("Out-of-bounds index {}", index)
                 }
@@ -357,7 +409,12 @@ where
     // Soundness: `slice.map` is `TrustedLen`.
     let buffer = unsafe { Buffer::try_from_trusted_len_iter(values)? };
 
-    Ok((buffer, indices.data_ref().null_buffer().cloned()))
+    Ok((
+        buffer,
+        indices_data
+            .null_buffer()
+            .map(|b| b.bit_slice(indices_data.offset(), indices.len())),
+    ))
 }
 
 // take implementation when both values and indices contain nulls
@@ -370,25 +427,41 @@ where
     I: ArrowNumericType,
     I::Native: ToPrimitive,
 {
+    take_values_indices_nulls_inner(
+        values.values(),
+        values.data(),
+        indices.values(),
+        indices.data(),
+    )
+}
+
+fn take_values_indices_nulls_inner<T, I>(
+    values: &[T],
+    values_data: &ArrayData,
+    indices: &[I],
+    indices_data: &ArrayData,
+) -> Result<(Buffer, Option<Buffer>)>
+where
+    T: ArrowNativeType,
+    I: ArrowNativeType,
+{
     let num_bytes = bit_util::ceil(indices.len(), 8);
     let mut nulls = MutableBuffer::new(num_bytes).with_bitset(num_bytes, true);
     let null_slice = nulls.as_slice_mut();
     let mut null_count = 0;
 
-    let values_values = values.values();
-    let values = indices.iter().enumerate().map(|(i, index)| match index {
-        Some(index) => {
+    let values = indices.iter().enumerate().map(|(i, &index)| {
+        if indices_data.is_null(i) {
+            null_count += 1;
+            bit_util::unset_bit(null_slice, i);
+            Ok(T::default())
+        } else {
             let index = maybe_usize::<I>(index)?;
-            if values.is_null(index) {
+            if values_data.is_null(index) {
                 null_count += 1;
                 bit_util::unset_bit(null_slice, i);
             }
-            Result::Ok(values_values[index])
-        }
-        None => {
-            null_count += 1;
-            bit_util::unset_bit(null_slice, i);
-            Ok(T::Native::default())
+            Result::Ok(values[index])
         }
     });
     // Soundness: `slice.map` is `TrustedLen`.
@@ -431,17 +504,17 @@ where
         (false, false) => {
             // * no nulls
             // * all `indices.values()` are valid
-            take_no_nulls::<T, I>(values.values(), indices.values())?
+            take_no_nulls::<T::Native, I::Native>(values.values(), indices.values())?
         }
         (true, false) => {
             // * nulls come from `values` alone
             // * all `indices.values()` are valid
-            take_values_nulls::<T, I>(values, indices.values())?
+            take_values_nulls::<T, I::Native>(values, indices.values())?
         }
         (false, true) => {
             // in this branch it is unsound to read and use `index.values()`,
             // as doing so is UB when they come from a null slot.
-            take_indices_nulls::<T, I>(values.values(), indices)?
+            take_indices_nulls::<T::Native, I>(values.values(), indices)?
         }
         (true, true) => {
             // in this branch it is unsound to read and use `index.values()`,
@@ -450,15 +523,17 @@ where
         }
     };
 
-    let data = ArrayData::new(
-        T::DATA_TYPE,
-        indices.len(),
-        None,
-        nulls,
-        0,
-        vec![buffer],
-        vec![],
-    );
+    let data = unsafe {
+        ArrayData::new_unchecked(
+            T::DATA_TYPE,
+            indices.len(),
+            None,
+            nulls,
+            0,
+            vec![buffer],
+            vec![],
+        )
+    };
     Ok(PrimitiveArray::<T>::from(data))
 }
 
@@ -516,7 +591,7 @@ where
         nulls = match indices.data_ref().null_buffer() {
             Some(buffer) => Some(buffer_bin_and(
                 buffer,
-                0,
+                indices.offset(),
                 &null_buf.into(),
                 0,
                 indices.len(),
@@ -525,15 +600,17 @@ where
         };
     }
 
-    let data = ArrayData::new(
-        DataType::Boolean,
-        indices.len(),
-        None,
-        nulls,
-        0,
-        vec![val_buf.into()],
-        vec![],
-    );
+    let data = unsafe {
+        ArrayData::new_unchecked(
+            DataType::Boolean,
+            indices.len(),
+            None,
+            nulls,
+            0,
+            vec![val_buf.into()],
+            vec![],
+        )
+    };
     Ok(BooleanArray::from(data))
 }
 
@@ -640,14 +717,17 @@ where
         };
     }
 
-    let mut data = ArrayData::builder(<OffsetSize as StringOffsetSizeTrait>::DATA_TYPE)
-        .len(data_len)
-        .add_buffer(offsets_buffer.into())
-        .add_buffer(values.into());
+    let mut array_data =
+        ArrayData::builder(<OffsetSize as StringOffsetSizeTrait>::DATA_TYPE)
+            .len(data_len)
+            .add_buffer(offsets_buffer.into())
+            .add_buffer(values.into());
     if let Some(null_buffer) = nulls {
-        data = data.null_bit_buffer(null_buffer);
+        array_data = array_data.null_bit_buffer(null_buffer);
     }
-    Ok(GenericStringArray::<OffsetSize>::from(data.build()))
+    let array_data = unsafe { array_data.build_unchecked() };
+
+    Ok(GenericStringArray::<OffsetSize>::from(array_data))
 }
 
 /// `take` implementation for list arrays
@@ -695,8 +775,10 @@ where
         .null_bit_buffer(null_buf.into())
         .offset(0)
         .add_child_data(taken.data().clone())
-        .add_buffer(value_offsets)
-        .build();
+        .add_buffer(value_offsets);
+
+    let list_data = unsafe { list_data.build_unchecked() };
+
     Ok(GenericListArray::<OffsetType::Native>::from(list_data))
 }
 
@@ -735,10 +817,64 @@ where
         .len(indices.len())
         .null_bit_buffer(null_buf.into())
         .offset(0)
-        .add_child_data(taken.data().clone())
-        .build();
+        .add_child_data(taken.data().clone());
+
+    let list_data = unsafe { list_data.build_unchecked() };
 
     Ok(FixedSizeListArray::from(list_data))
+}
+
+fn take_binary<IndexType, OffsetType>(
+    values: &GenericBinaryArray<OffsetType>,
+    indices: &PrimitiveArray<IndexType>,
+) -> Result<GenericBinaryArray<OffsetType>>
+where
+    OffsetType: BinaryOffsetSizeTrait,
+    IndexType: ArrowNumericType,
+    IndexType::Native: ToPrimitive,
+{
+    let data_ref = values.data_ref();
+    let array_iter = indices
+        .values()
+        .iter()
+        .map(|idx| {
+            let idx = maybe_usize::<IndexType::Native>(*idx)?;
+            if data_ref.is_valid(idx) {
+                Ok(Some(values.value(idx)))
+            } else {
+                Ok(None)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter();
+
+    Ok(array_iter.collect::<GenericBinaryArray<OffsetType>>())
+}
+
+fn take_fixed_size_binary<IndexType>(
+    values: &FixedSizeBinaryArray,
+    indices: &PrimitiveArray<IndexType>,
+) -> Result<FixedSizeBinaryArray>
+where
+    IndexType: ArrowNumericType,
+    IndexType::Native: ToPrimitive,
+{
+    let data_ref = values.data_ref();
+    let array_iter = indices
+        .values()
+        .iter()
+        .map(|idx| {
+            let idx = maybe_usize::<IndexType::Native>(*idx)?;
+            if data_ref.is_valid(idx) {
+                Ok(Some(values.value(idx)))
+            } else {
+                Ok(None)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter();
+
+    FixedSizeBinaryArray::try_from_sparse_iter(array_iter)
 }
 
 /// `take` implementation for dictionary arrays
@@ -758,15 +894,17 @@ where
     let new_keys = take_primitive::<T, I>(values.keys(), indices)?;
     let new_keys_data = new_keys.data_ref();
 
-    let data = ArrayData::new(
-        values.data_type().clone(),
-        new_keys.len(),
-        Some(new_keys_data.null_count()),
-        new_keys_data.null_buffer().cloned(),
-        0,
-        new_keys_data.buffers().to_vec(),
-        values.data().child_data().to_vec(),
-    );
+    let data = unsafe {
+        ArrayData::new_unchecked(
+            values.data_type().clone(),
+            new_keys.len(),
+            Some(new_keys_data.null_count()),
+            new_keys_data.null_buffer().cloned(),
+            0,
+            new_keys_data.buffers().to_vec(),
+            values.data().child_data().to_vec(),
+        )
+    };
 
     Ok(DictionaryArray::<T>::from(data))
 }
@@ -805,6 +943,24 @@ mod tests {
         Ok(())
     }
 
+    fn test_take_primitive_arrays_non_null<T>(
+        data: Vec<T::Native>,
+        index: &UInt32Array,
+        options: Option<TakeOptions>,
+        expected_data: Vec<Option<T::Native>>,
+    ) -> Result<()>
+    where
+        T: ArrowPrimitiveType,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
+        PrimitiveArray<T>: From<Vec<Option<T::Native>>>,
+    {
+        let output = PrimitiveArray::<T>::from(data);
+        let expected = Arc::new(PrimitiveArray::<T>::from(expected_data)) as ArrayRef;
+        let output = take(&output, index, options)?;
+        assert_eq!(&output, &expected);
+        Ok(())
+    }
+
     fn test_take_impl_primitive_arrays<T, I>(
         data: Vec<Option<T::Native>>,
         index: &PrimitiveArray<I>,
@@ -824,20 +980,34 @@ mod tests {
     }
 
     // create a simple struct for testing purposes
-    fn create_test_struct() -> StructArray {
-        let boolean_data = BooleanArray::from(vec![true, false, false, true])
-            .data()
-            .clone();
-        let int_data = Int32Array::from(vec![42, 28, 19, 31]).data().clone();
-        let mut field_types = vec![];
-        field_types.push(Field::new("a", DataType::Boolean, true));
-        field_types.push(Field::new("b", DataType::Int32, true));
-        let struct_array_data = ArrayData::builder(DataType::Struct(field_types))
-            .len(4)
-            .add_child_data(boolean_data)
-            .add_child_data(int_data)
-            .build();
-        StructArray::from(struct_array_data)
+    fn create_test_struct(
+        values: Vec<Option<(Option<bool>, Option<i32>)>>,
+    ) -> StructArray {
+        let mut struct_builder = StructBuilder::new(
+            vec![
+                Field::new("a", DataType::Boolean, true),
+                Field::new("b", DataType::Int32, true),
+            ],
+            vec![
+                Box::new(BooleanBuilder::new(values.len())),
+                Box::new(Int32Builder::new(values.len())),
+            ],
+        );
+
+        for value in values {
+            struct_builder
+                .field_builder::<BooleanBuilder>(0)
+                .unwrap()
+                .append_option(value.and_then(|v| v.0))
+                .unwrap();
+            struct_builder
+                .field_builder::<Int32Builder>(1)
+                .unwrap()
+                .append_option(value.and_then(|v| v.1))
+                .unwrap();
+            struct_builder.append(value.is_some()).unwrap();
+        }
+        struct_builder.finish()
     }
 
     #[test]
@@ -872,6 +1042,48 @@ mod tests {
             &index,
             None,
             vec![Some(0), Some(1), Some(2), Some(3), Some(3), Some(5)],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_take_primitive_nullable_indices_non_null_values_with_offset() {
+        let index =
+            UInt32Array::from(vec![Some(0), Some(1), Some(2), Some(3), None, None]);
+        let index = index.slice(2, 4);
+        let index = index.as_any().downcast_ref::<UInt32Array>().unwrap();
+
+        assert_eq!(
+            index,
+            &UInt32Array::from(vec![Some(2), Some(3), None, None])
+        );
+
+        test_take_primitive_arrays_non_null::<Int64Type>(
+            vec![0, 10, 20, 30, 40, 50],
+            index,
+            None,
+            vec![Some(20), Some(30), None, None],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_take_primitive_nullable_indices_nullable_values_with_offset() {
+        let index =
+            UInt32Array::from(vec![Some(0), Some(1), Some(2), Some(3), None, None]);
+        let index = index.slice(2, 4);
+        let index = index.as_any().downcast_ref::<UInt32Array>().unwrap();
+
+        assert_eq!(
+            index,
+            &UInt32Array::from(vec![Some(2), Some(3), None, None])
+        );
+
+        test_take_primitive_arrays::<Int64Type>(
+            vec![None, None, Some(20), Some(30), Some(40), Some(50)],
+            index,
+            None,
+            vec![Some(20), Some(30), None, None],
         )
         .unwrap();
     }
@@ -1100,7 +1312,7 @@ mod tests {
     }
 
     #[test]
-    fn test_take_primitive_bool() {
+    fn test_take_bool() {
         let index = UInt32Array::from(vec![Some(3), None, Some(1), Some(3), Some(2)]);
         // boolean
         test_take_boolean_arrays(
@@ -1108,6 +1320,25 @@ mod tests {
             &index,
             None,
             vec![Some(false), None, None, Some(false), Some(true)],
+        );
+    }
+
+    #[test]
+    fn test_take_bool_with_offset() {
+        let index =
+            UInt32Array::from(vec![Some(3), None, Some(1), Some(3), Some(2), None]);
+        let index = index.slice(2, 4);
+        let index = index
+            .as_any()
+            .downcast_ref::<PrimitiveArray<UInt32Type>>()
+            .unwrap();
+
+        // boolean
+        test_take_boolean_arrays(
+            vec![Some(false), None, Some(true), Some(false), None],
+            index,
+            None,
+            vec![None, Some(false), Some(true), None],
         );
     }
 
@@ -1164,7 +1395,8 @@ mod tests {
                 .len(3)
                 .add_buffer(value_offsets)
                 .add_child_data(value_data)
-                .build();
+                .build()
+                .unwrap();
             let list_array = $list_array_type::from(list_data);
 
             // index returns: [[2,3], null, [-1,-2,-1], [2,3], [0,0,0]]
@@ -1202,7 +1434,8 @@ mod tests {
                 )
                 .add_buffer(expected_offsets)
                 .add_child_data(expected_data)
-                .build();
+                .build()
+                .unwrap();
             let expected_list_array = $list_array_type::from(expected_list_data);
 
             assert_eq!(a, &expected_list_array);
@@ -1239,7 +1472,8 @@ mod tests {
                 .add_buffer(value_offsets)
                 .null_bit_buffer(Buffer::from([0b10111101, 0b00000000]))
                 .add_child_data(value_data)
-                .build();
+                .build()
+                .unwrap();
             let list_array = $list_array_type::from(list_data);
 
             // index returns: [[null], null, [-1,-2,3], [2,null], [0,null,0]]
@@ -1276,7 +1510,8 @@ mod tests {
                 )
                 .add_buffer(expected_offsets)
                 .add_child_data(expected_data)
-                .build();
+                .build()
+                .unwrap();
             let expected_list_array = $list_array_type::from(expected_list_data);
 
             assert_eq!(a, &expected_list_array);
@@ -1312,7 +1547,8 @@ mod tests {
                 .add_buffer(value_offsets)
                 .null_bit_buffer(Buffer::from([0b01111101]))
                 .add_child_data(value_data)
-                .build();
+                .build()
+                .unwrap();
             let list_array = $list_array_type::from(list_data);
 
             // index returns: [null, null, [-1,-2,3], [5,null], [0,null,0]]
@@ -1350,7 +1586,8 @@ mod tests {
                 .null_bit_buffer(Buffer::from(null_bits))
                 .add_buffer(expected_offsets)
                 .add_child_data(expected_data)
-                .build();
+                .build()
+                .unwrap();
             let expected_list_array = $list_array_type::from(expected_list_data);
 
             assert_eq!(a, &expected_list_array);
@@ -1479,7 +1716,8 @@ mod tests {
             .len(3)
             .add_buffer(value_offsets)
             .add_child_data(value_data)
-            .build();
+            .build()
+            .unwrap();
         let list_array = ListArray::from(list_data);
 
         let index = UInt32Array::from(vec![1000]);
@@ -1491,61 +1729,59 @@ mod tests {
 
     #[test]
     fn test_take_struct() {
-        let array = create_test_struct();
+        let array = create_test_struct(vec![
+            Some((Some(true), Some(42))),
+            Some((Some(false), Some(28))),
+            Some((Some(false), Some(19))),
+            Some((Some(true), Some(31))),
+            None,
+        ]);
 
-        let index = UInt32Array::from(vec![0, 3, 1, 0, 2]);
-        let a = take(&array, &index, None).unwrap();
-        let a: &StructArray = a.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(index.len(), a.len());
-        assert_eq!(0, a.null_count());
+        let index = UInt32Array::from(vec![0, 3, 1, 0, 2, 4]);
+        let actual = take(&array, &index, None).unwrap();
+        let actual: &StructArray = actual.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(index.len(), actual.len());
+        assert_eq!(1, actual.null_count());
 
-        let expected_bool_data = BooleanArray::from(vec![true, true, false, true, false])
-            .data()
-            .clone();
-        let expected_int_data = Int32Array::from(vec![42, 31, 28, 42, 19]).data().clone();
-        let mut field_types = vec![];
-        field_types.push(Field::new("a", DataType::Boolean, true));
-        field_types.push(Field::new("b", DataType::Int32, true));
-        let struct_array_data = ArrayData::builder(DataType::Struct(field_types))
-            .len(5)
-            .add_child_data(expected_bool_data)
-            .add_child_data(expected_int_data)
-            .build();
-        let struct_array = StructArray::from(struct_array_data);
+        let expected = create_test_struct(vec![
+            Some((Some(true), Some(42))),
+            Some((Some(true), Some(31))),
+            Some((Some(false), Some(28))),
+            Some((Some(true), Some(42))),
+            Some((Some(false), Some(19))),
+            None,
+        ]);
 
-        assert_eq!(a, &struct_array);
+        assert_eq!(&expected, actual);
     }
 
     #[test]
-    fn test_take_struct_with_nulls() {
-        let array = create_test_struct();
+    fn test_take_struct_with_null_indices() {
+        let array = create_test_struct(vec![
+            Some((Some(true), Some(42))),
+            Some((Some(false), Some(28))),
+            Some((Some(false), Some(19))),
+            Some((Some(true), Some(31))),
+            None,
+        ]);
 
-        let index = UInt32Array::from(vec![None, Some(3), Some(1), None, Some(0)]);
-        let a = take(&array, &index, None).unwrap();
-        let a: &StructArray = a.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(index.len(), a.len());
-        assert_eq!(0, a.null_count());
+        let index =
+            UInt32Array::from(vec![None, Some(3), Some(1), None, Some(0), Some(4)]);
+        let actual = take(&array, &index, None).unwrap();
+        let actual: &StructArray = actual.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(index.len(), actual.len());
+        assert_eq!(3, actual.null_count()); // 2 because of indices, 1 because of struct array
 
-        let expected_bool_data =
-            BooleanArray::from(vec![None, Some(true), Some(false), None, Some(true)])
-                .data()
-                .clone();
-        let expected_int_data =
-            Int32Array::from(vec![None, Some(31), Some(28), None, Some(42)])
-                .data()
-                .clone();
+        let expected = create_test_struct(vec![
+            None,
+            Some((Some(true), Some(31))),
+            Some((Some(false), Some(28))),
+            None,
+            Some((Some(true), Some(42))),
+            None,
+        ]);
 
-        let mut field_types = vec![];
-        field_types.push(Field::new("a", DataType::Boolean, true));
-        field_types.push(Field::new("b", DataType::Int32, true));
-        let struct_array_data = ArrayData::builder(DataType::Struct(field_types))
-            .len(5)
-            // TODO: see https://issues.apache.org/jira/browse/ARROW-5408 for why count != 2
-            .add_child_data(expected_bool_data)
-            .add_child_data(expected_int_data)
-            .build();
-        let struct_array = StructArray::from(struct_array_data);
-        assert_eq!(a, &struct_array);
+        assert_eq!(&expected, actual);
     }
 
     #[test]

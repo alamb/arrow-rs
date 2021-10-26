@@ -21,6 +21,7 @@
 use std::sync::Arc;
 
 use crate::array::*;
+use crate::compute::kernels::concat::concat;
 use crate::datatypes::*;
 use crate::error::{ArrowError, Result};
 
@@ -36,10 +37,10 @@ use crate::error::{ArrowError, Result};
 /// serialization and computation functions, possibly incremental.
 /// See also [CSV reader](crate::csv::Reader) and
 /// [JSON reader](crate::json::Reader).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RecordBatch {
     schema: SchemaRef,
-    columns: Vec<Arc<Array>>,
+    columns: Vec<Arc<dyn Array>>,
 }
 
 impl RecordBatch {
@@ -244,6 +245,31 @@ impl RecordBatch {
         &self.columns[..]
     }
 
+    /// Return a new RecordBatch where each column is sliced
+    /// according to `offset` and `length`
+    ///
+    /// # Panics
+    ///
+    /// Panics if `offset` with `length` is greater than column length.
+    pub fn slice(&self, offset: usize, length: usize) -> RecordBatch {
+        if self.schema.fields().is_empty() {
+            assert!((offset + length) == 0);
+            return RecordBatch::new_empty(self.schema.clone());
+        }
+        assert!((offset + length) <= self.num_rows());
+
+        let columns = self
+            .columns()
+            .iter()
+            .map(|column| column.slice(offset, length))
+            .collect();
+
+        Self {
+            schema: self.schema.clone(),
+            columns,
+        }
+    }
+
     /// Create a `RecordBatch` from an iterable list of pairs of the
     /// form `(field_name, array)`, with the same requirements on
     /// fields and arrays as [`RecordBatch::try_new`]. This method is
@@ -327,6 +353,35 @@ impl RecordBatch {
 
         let schema = Arc::new(Schema::new(fields));
         RecordBatch::try_new(schema, columns)
+    }
+
+    /// Concatenates `batches` together into a single record batch.
+    pub fn concat(schema: &SchemaRef, batches: &[Self]) -> Result<Self> {
+        if batches.is_empty() {
+            return Ok(RecordBatch::new_empty(schema.clone()));
+        }
+        if let Some((i, _)) = batches
+            .iter()
+            .enumerate()
+            .find(|&(_, batch)| batch.schema() != *schema)
+        {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "batches[{}] schema is different with argument schema.",
+                i
+            )));
+        }
+        let field_num = schema.fields().len();
+        let mut arrays = Vec::with_capacity(field_num);
+        for i in 0..field_num {
+            let array = concat(
+                &batches
+                    .iter()
+                    .map(|batch| batch.column(i).as_ref())
+                    .collect::<Vec<_>>(),
+            )?;
+            arrays.push(array);
+        }
+        Self::try_new(schema.clone(), arrays)
     }
 }
 
@@ -414,16 +469,68 @@ mod tests {
         let record_batch =
             RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a), Arc::new(b)])
                 .unwrap();
-        check_batch(record_batch)
+        check_batch(record_batch, 5)
     }
 
-    fn check_batch(record_batch: RecordBatch) {
-        assert_eq!(5, record_batch.num_rows());
+    fn check_batch(record_batch: RecordBatch, num_rows: usize) {
+        assert_eq!(num_rows, record_batch.num_rows());
         assert_eq!(2, record_batch.num_columns());
         assert_eq!(&DataType::Int32, record_batch.schema().field(0).data_type());
         assert_eq!(&DataType::Utf8, record_batch.schema().field(1).data_type());
-        assert_eq!(5, record_batch.column(0).data().len());
-        assert_eq!(5, record_batch.column(1).data().len());
+        assert_eq!(num_rows, record_batch.column(0).data().len());
+        assert_eq!(num_rows, record_batch.column(1).data().len());
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed: (offset + length) <= self.num_rows()")]
+    fn create_record_batch_slice() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, false),
+        ]);
+        let expected_schema = schema.clone();
+
+        let a = Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let b = StringArray::from(vec!["a", "b", "c", "d", "e", "f", "h", "i"]);
+
+        let record_batch =
+            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a), Arc::new(b)])
+                .unwrap();
+
+        let offset = 2;
+        let length = 5;
+        let record_batch_slice = record_batch.slice(offset, length);
+
+        assert_eq!(record_batch_slice.schema().as_ref(), &expected_schema);
+        check_batch(record_batch_slice, 5);
+
+        let offset = 2;
+        let length = 0;
+        let record_batch_slice = record_batch.slice(offset, length);
+
+        assert_eq!(record_batch_slice.schema().as_ref(), &expected_schema);
+        check_batch(record_batch_slice, 0);
+
+        let offset = 2;
+        let length = 10;
+        let _record_batch_slice = record_batch.slice(offset, length);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed: (offset + length) == 0")]
+    fn create_record_batch_slice_empty_batch() {
+        let schema = Schema::new(vec![]);
+
+        let record_batch = RecordBatch::new_empty(Arc::new(schema));
+
+        let offset = 0;
+        let length = 0;
+        let record_batch_slice = record_batch.slice(offset, length);
+        assert_eq!(0, record_batch_slice.schema().fields().len());
+
+        let offset = 1;
+        let length = 2;
+        let _record_batch_slice = record_batch.slice(offset, length);
     }
 
     #[test]
@@ -445,7 +552,7 @@ mod tests {
             Field::new("b", DataType::Utf8, false),
         ]);
         assert_eq!(record_batch.schema().as_ref(), &expected_schema);
-        check_batch(record_batch);
+        check_batch(record_batch, 5);
     }
 
     #[test]
@@ -465,7 +572,7 @@ mod tests {
             Field::new("b", DataType::Utf8, true),
         ]);
         assert_eq!(record_batch.schema().as_ref(), &expected_schema);
-        check_batch(record_batch);
+        check_batch(record_batch, 5);
     }
 
     #[test]
@@ -501,7 +608,8 @@ mod tests {
         .add_child_data(a2_child.data().clone())
         .len(2)
         .add_buffer(Buffer::from(vec![0i32, 3, 4].to_byte_slice()))
-        .build();
+        .build()
+        .unwrap();
         let a2: ArrayRef = Arc::new(ListArray::from(a2));
         let a = ArrayDataBuilder::new(DataType::Struct(vec![
             Field::new("aa1", DataType::Int32, false),
@@ -510,7 +618,8 @@ mod tests {
         .add_child_data(a1.data().clone())
         .add_child_data(a2.data().clone())
         .len(2)
-        .build();
+        .build()
+        .unwrap();
         let a: ArrayRef = Arc::new(StructArray::from(a));
 
         // creating the batch with field name validation should fail
@@ -561,5 +670,234 @@ mod tests {
         );
         assert_eq!(batch.column(0).as_ref(), boolean.as_ref());
         assert_eq!(batch.column(1).as_ref(), int.as_ref());
+    }
+
+    #[test]
+    fn concat_record_batches() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, false),
+        ]));
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![3, 4])),
+                Arc::new(StringArray::from(vec!["c", "d"])),
+            ],
+        )
+        .unwrap();
+        let new_batch = RecordBatch::concat(&schema, &[batch1, batch2]).unwrap();
+        assert_eq!(new_batch.schema().as_ref(), schema.as_ref());
+        assert_eq!(2, new_batch.num_columns());
+        assert_eq!(4, new_batch.num_rows());
+    }
+
+    #[test]
+    fn concat_empty_record_batch() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::concat(&schema, &[]).unwrap();
+        assert_eq!(batch.schema().as_ref(), schema.as_ref());
+        assert_eq!(0, batch.num_rows());
+    }
+
+    #[test]
+    fn concat_record_batches_of_different_schemas() {
+        let schema1 = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, false),
+        ]));
+        let schema2 = Arc::new(Schema::new(vec![
+            Field::new("c", DataType::Int32, false),
+            Field::new("d", DataType::Utf8, false),
+        ]));
+        let batch1 = RecordBatch::try_new(
+            schema1.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+        let batch2 = RecordBatch::try_new(
+            schema2,
+            vec![
+                Arc::new(Int32Array::from(vec![3, 4])),
+                Arc::new(StringArray::from(vec!["c", "d"])),
+            ],
+        )
+        .unwrap();
+        let error = RecordBatch::concat(&schema1, &[batch1, batch2]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Invalid argument error: batches[1] schema is different with argument schema.",
+        );
+    }
+
+    #[test]
+    fn record_batch_equality() {
+        let id_arr1 = Int32Array::from(vec![1, 2, 3, 4]);
+        let val_arr1 = Int32Array::from(vec![5, 6, 7, 8]);
+        let schema1 = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Int32, false),
+        ]);
+
+        let id_arr2 = Int32Array::from(vec![1, 2, 3, 4]);
+        let val_arr2 = Int32Array::from(vec![5, 6, 7, 8]);
+        let schema2 = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Int32, false),
+        ]);
+
+        let batch1 = RecordBatch::try_new(
+            Arc::new(schema1),
+            vec![Arc::new(id_arr1), Arc::new(val_arr1)],
+        )
+        .unwrap();
+
+        let batch2 = RecordBatch::try_new(
+            Arc::new(schema2),
+            vec![Arc::new(id_arr2), Arc::new(val_arr2)],
+        )
+        .unwrap();
+
+        assert_eq!(batch1, batch2);
+    }
+
+    #[test]
+    fn record_batch_vals_ne() {
+        let id_arr1 = Int32Array::from(vec![1, 2, 3, 4]);
+        let val_arr1 = Int32Array::from(vec![5, 6, 7, 8]);
+        let schema1 = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Int32, false),
+        ]);
+
+        let id_arr2 = Int32Array::from(vec![1, 2, 3, 4]);
+        let val_arr2 = Int32Array::from(vec![1, 2, 3, 4]);
+        let schema2 = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Int32, false),
+        ]);
+
+        let batch1 = RecordBatch::try_new(
+            Arc::new(schema1),
+            vec![Arc::new(id_arr1), Arc::new(val_arr1)],
+        )
+        .unwrap();
+
+        let batch2 = RecordBatch::try_new(
+            Arc::new(schema2),
+            vec![Arc::new(id_arr2), Arc::new(val_arr2)],
+        )
+        .unwrap();
+
+        assert_ne!(batch1, batch2);
+    }
+
+    #[test]
+    fn record_batch_column_names_ne() {
+        let id_arr1 = Int32Array::from(vec![1, 2, 3, 4]);
+        let val_arr1 = Int32Array::from(vec![5, 6, 7, 8]);
+        let schema1 = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Int32, false),
+        ]);
+
+        let id_arr2 = Int32Array::from(vec![1, 2, 3, 4]);
+        let val_arr2 = Int32Array::from(vec![5, 6, 7, 8]);
+        let schema2 = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("num", DataType::Int32, false),
+        ]);
+
+        let batch1 = RecordBatch::try_new(
+            Arc::new(schema1),
+            vec![Arc::new(id_arr1), Arc::new(val_arr1)],
+        )
+        .unwrap();
+
+        let batch2 = RecordBatch::try_new(
+            Arc::new(schema2),
+            vec![Arc::new(id_arr2), Arc::new(val_arr2)],
+        )
+        .unwrap();
+
+        assert_ne!(batch1, batch2);
+    }
+
+    #[test]
+    fn record_batch_column_number_ne() {
+        let id_arr1 = Int32Array::from(vec![1, 2, 3, 4]);
+        let val_arr1 = Int32Array::from(vec![5, 6, 7, 8]);
+        let schema1 = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Int32, false),
+        ]);
+
+        let id_arr2 = Int32Array::from(vec![1, 2, 3, 4]);
+        let val_arr2 = Int32Array::from(vec![5, 6, 7, 8]);
+        let num_arr2 = Int32Array::from(vec![5, 6, 7, 8]);
+        let schema2 = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Int32, false),
+            Field::new("num", DataType::Int32, false),
+        ]);
+
+        let batch1 = RecordBatch::try_new(
+            Arc::new(schema1),
+            vec![Arc::new(id_arr1), Arc::new(val_arr1)],
+        )
+        .unwrap();
+
+        let batch2 = RecordBatch::try_new(
+            Arc::new(schema2),
+            vec![Arc::new(id_arr2), Arc::new(val_arr2), Arc::new(num_arr2)],
+        )
+        .unwrap();
+
+        assert_ne!(batch1, batch2);
+    }
+
+    #[test]
+    fn record_batch_row_count_ne() {
+        let id_arr1 = Int32Array::from(vec![1, 2, 3]);
+        let val_arr1 = Int32Array::from(vec![5, 6, 7]);
+        let schema1 = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("val", DataType::Int32, false),
+        ]);
+
+        let id_arr2 = Int32Array::from(vec![1, 2, 3, 4]);
+        let val_arr2 = Int32Array::from(vec![5, 6, 7, 8]);
+        let schema2 = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("num", DataType::Int32, false),
+        ]);
+
+        let batch1 = RecordBatch::try_new(
+            Arc::new(schema1),
+            vec![Arc::new(id_arr1), Arc::new(val_arr1)],
+        )
+        .unwrap();
+
+        let batch2 = RecordBatch::try_new(
+            Arc::new(schema2),
+            vec![Arc::new(id_arr2), Arc::new(val_arr2)],
+        )
+        .unwrap();
+
+        assert_ne!(batch1, batch2);
     }
 }

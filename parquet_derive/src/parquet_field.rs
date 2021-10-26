@@ -174,6 +174,61 @@ impl Field {
         }
     }
 
+    pub fn parquet_type(&self) -> proc_macro2::TokenStream {
+        // TODO: Support group types
+        // TODO: Add length if dealing with fixedlenbinary
+
+        let field_name = &self.ident.to_string();
+        let physical_type = match self.ty.physical_type() {
+            parquet::basic::Type::BOOLEAN => quote! {
+                parquet::basic::Type::BOOLEAN
+            },
+            parquet::basic::Type::INT32 => quote! {
+                parquet::basic::Type::INT32
+            },
+            parquet::basic::Type::INT64 => quote! {
+                parquet::basic::Type::INT64
+            },
+            parquet::basic::Type::INT96 => quote! {
+                parquet::basic::Type::INT96
+            },
+            parquet::basic::Type::FLOAT => quote! {
+                parquet::basic::Type::FLOAT
+            },
+            parquet::basic::Type::DOUBLE => quote! {
+                parquet::basic::Type::DOUBLE
+            },
+            parquet::basic::Type::BYTE_ARRAY => quote! {
+                parquet::basic::Type::BYTE_ARRAY
+            },
+            parquet::basic::Type::FIXED_LEN_BYTE_ARRAY => quote! {
+                parquet::basic::Type::FIXED_LEN_BYTE_ARRAY
+            },
+        };
+        let logical_type = self.ty.logical_type();
+        let repetition = self.ty.repetition();
+        let converted_type = self.ty.converted_type();
+
+        if let Some(converted_type) = converted_type {
+            quote! {
+                fields.push(ParquetType::primitive_type_builder(#field_name, #physical_type)
+                    .with_logical_type(#logical_type)
+                    .with_repetition(#repetition)
+                    .with_converted_type(#converted_type)
+                    .build().unwrap().into()
+                )
+            }
+        } else {
+            quote! {
+                fields.push(ParquetType::primitive_type_builder(#field_name, #physical_type)
+                    .with_logical_type(#logical_type)
+                    .with_repetition(#repetition)
+                    .build().unwrap().into()
+                )
+            }
+        }
+    }
+
     fn option_into_vals(&self) -> proc_macro2::TokenStream {
         let field_name = &self.ident;
         let is_a_byte_buf = self.is_a_byte_buf;
@@ -201,7 +256,12 @@ impl Field {
         } else if is_a_byte_buf {
             quote! { Some((&inner[..]).into())}
         } else {
-            quote! { Some(inner) }
+            // Type might need converting to a physical type
+            match self.ty.physical_type() {
+                parquet::basic::Type::INT32 => quote! { Some(inner as i32) },
+                parquet::basic::Type::INT64 => quote! { Some(inner as i64) },
+                _ => quote! { Some(inner) },
+            }
         };
 
         quote! {
@@ -232,7 +292,12 @@ impl Field {
         } else if is_a_byte_buf {
             quote! { (&rec.#field_name[..]).into() }
         } else {
-            quote! { rec.#field_name }
+            // Type might need converting to a physical type
+            match self.ty.physical_type() {
+                parquet::basic::Type::INT32 => quote! { rec.#field_name as i32 },
+                parquet::basic::Type::INT64 => quote! { rec.#field_name as i64 },
+                _ => quote! { rec.#field_name },
+            }
         };
 
         quote! {
@@ -403,11 +468,105 @@ impl Type {
             "bool" => BasicType::BOOLEAN,
             "u8" | "u16" | "u32" => BasicType::INT32,
             "i8" | "i16" | "i32" | "NaiveDate" => BasicType::INT32,
-            "u64" | "i64" | "usize" | "NaiveDateTime" => BasicType::INT64,
+            "u64" | "i64" | "NaiveDateTime" => BasicType::INT64,
+            "usize" | "isize" => {
+                if usize::BITS == 64 {
+                    BasicType::INT64
+                } else {
+                    BasicType::INT32
+                }
+            }
             "f32" => BasicType::FLOAT,
             "f64" => BasicType::DOUBLE,
             "String" | "str" | "Uuid" => BasicType::BYTE_ARRAY,
             f => unimplemented!("{} currently is not supported", f),
+        }
+    }
+
+    fn logical_type(&self) -> proc_macro2::TokenStream {
+        let last_part = self.last_part();
+        let leaf_type = self.leaf_type_recursive();
+
+        match leaf_type {
+            Type::Array(ref first_type) => {
+                if let Type::TypePath(_) = **first_type {
+                    if last_part == "u8" {
+                        return quote! { None };
+                    }
+                }
+            }
+            Type::Vec(ref first_type) => {
+                if let Type::TypePath(_) = **first_type {
+                    if last_part == "u8" {
+                        return quote! { None };
+                    }
+                }
+            }
+            _ => (),
+        }
+
+        match last_part.trim() {
+            "bool" => quote! { None },
+            "u8" => quote! { Some(LogicalType::INTEGER(IntType {
+                bit_width: 8,
+                is_signed: false,
+            })) },
+            "u16" => quote! { Some(LogicalType::INTEGER(IntType {
+                bit_width: 16,
+                is_signed: false,
+            })) },
+            "u32" => quote! { Some(LogicalType::INTEGER(IntType {
+                bit_width: 32,
+                is_signed: false,
+            })) },
+            "u64" => quote! { Some(LogicalType::INTEGER(IntType {
+                bit_width: 64,
+                is_signed: false,
+            })) },
+            "i8" => quote! { Some(LogicalType::INTEGER(IntType {
+                bit_width: 8,
+                is_signed: true,
+            })) },
+            "i16" => quote! { Some(LogicalType::INTEGER(IntType {
+                bit_width: 16,
+                is_signed: true,
+            })) },
+            "i32" | "i64" => quote! { None },
+            "usize" => {
+                quote! { Some(LogicalType::INTEGER(IntType {
+                    bit_width: usize::BITS as i8,
+                    is_signed: false
+                })) }
+            }
+            "isize" => {
+                quote! { Some(LogicalType::INTEGER(IntType {
+                    bit_width: usize::BITS as i8,
+                    is_signed: true
+                })) }
+            }
+            "NaiveDate" => quote! { Some(LogicalType::DATE(Default::default())) },
+            "NaiveDateTime" => quote! { None },
+            "f32" | "f64" => quote! { None },
+            "String" | "str" => quote! { Some(LogicalType::STRING(Default::default())) },
+            "Uuid" => quote! { Some(LogicalType::UUID(Default::default())) },
+            f => unimplemented!("{} currently is not supported", f),
+        }
+    }
+
+    fn converted_type(&self) -> Option<proc_macro2::TokenStream> {
+        let last_part = self.last_part();
+
+        match last_part.trim() {
+            "NaiveDateTime" => Some(quote! { ConvertedType::TIMESTAMP_MILLIS }),
+            _ => None,
+        }
+    }
+
+    fn repetition(&self) -> proc_macro2::TokenStream {
+        match &self {
+            Type::Option(_) => quote! { Repetition::OPTIONAL },
+            Type::Reference(_, ty) => ty.repetition(),
+            _ => quote! { Repetition::REQUIRED },
         }
     }
 
@@ -505,7 +664,7 @@ mod test {
         assert_eq!(snippet,
                    (quote!{
                         {
-                            let vals : Vec < _ > = records . iter ( ) . map ( | rec | rec . counter ) . collect ( );
+                            let vals : Vec < _ > = records . iter ( ) . map ( | rec | rec . counter as i64 ) . collect ( );
 
                             if let parquet::column::writer::ColumnWriter::Int64ColumnWriter ( ref mut typed ) = column_writer {
                                 typed . write_batch ( & vals [ .. ] , None , None ) ?;
@@ -585,7 +744,7 @@ mod test {
 
                         let vals: Vec <_> = records.iter().filter_map( |rec| {
                             if let Some ( inner ) = rec . optional_dumb_int {
-                                Some ( inner )
+                                Some ( inner as i32 )
                             } else {
                                 None
                             }
@@ -636,12 +795,13 @@ mod test {
           struct ABasicStruct {
             yes_no: bool,
             name: String,
+            length: usize
           }
         };
 
         let fields = extract_fields(snippet);
         let processed: Vec<_> = fields.iter().map(|field| Field::from(field)).collect();
-        assert_eq!(processed.len(), 2);
+        assert_eq!(processed.len(), 3);
 
         assert_eq!(
             processed,
@@ -656,6 +816,12 @@ mod test {
                     ident: syn::Ident::new("name", proc_macro2::Span::call_site()),
                     ty: Type::TypePath(syn::parse_quote!(String)),
                     is_a_byte_buf: true,
+                    third_party_type: None,
+                },
+                Field {
+                    ident: syn::Ident::new("length", proc_macro2::Span::call_site()),
+                    ty: Type::TypePath(syn::parse_quote!(usize)),
+                    is_a_byte_buf: false,
                     third_party_type: None,
                 }
             ]
@@ -799,7 +965,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "chrono")]
     fn test_chrono_timestamp_millis() {
         let snippet: proc_macro2::TokenStream = quote! {
           struct ATimestampStruct {
@@ -826,7 +991,11 @@ mod test {
             {
                 let definition_levels : Vec<i16> = self.iter().map(|rec| if rec.maybe_happened.is_some() { 1 } else { 0 }).collect();
                 let vals : Vec<_> = records.iter().filter_map(|rec| {
-                    rec.maybe_happened.map(|inner| {  inner.timestamp_millis()  })
+                    if let Some(inner) = rec.maybe_happened {
+                        Some(inner.timestamp_millis())
+                    } else {
+                        None
+                    }
                 }).collect();
 
                 if let parquet::column::writer::ColumnWriter::Int64ColumnWriter(ref mut typed) = column_writer {
@@ -839,7 +1008,6 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "chrono")]
     fn test_chrono_date() {
         let snippet: proc_macro2::TokenStream = quote! {
           struct ATimestampStruct {
@@ -866,7 +1034,11 @@ mod test {
             {
                 let definition_levels : Vec<i16> = self.iter().map(|rec| if rec.maybe_happened.is_some() { 1 } else { 0 }).collect();
                 let vals : Vec<_> = records.iter().filter_map(|rec| {
-                    rec.maybe_happened.map(|inner| {  inner.signed_duration_since(chrono::NaiveDate::from_ymd(1970, 1, 1)).num_days() as i32  })
+                    if let Some(inner) = rec.maybe_happened {
+                        Some(inner.signed_duration_since(chrono::NaiveDate::from_ymd(1970, 1, 1)).num_days() as i32)
+                    } else {
+                        None
+                    }
                 }).collect();
 
                 if let parquet::column::writer::ColumnWriter::Int32ColumnWriter(ref mut typed) = column_writer {
@@ -879,10 +1051,9 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "uuid")]
     fn test_uuid() {
         let snippet: proc_macro2::TokenStream = quote! {
-          struct ATimestampStruct {
+          struct AUuidStruct {
             unique_id: uuid::Uuid,
             maybe_unique_id: Option<&uuid::Uuid>,
           }
@@ -906,7 +1077,11 @@ mod test {
             {
                 let definition_levels : Vec<i16> = self.iter().map(|rec| if rec.maybe_unique_id.is_some() { 1 } else { 0 }).collect();
                 let vals : Vec<_> = records.iter().filter_map(|rec| {
-                    rec.maybe_unique_id.map(|ref inner| {  (&inner.to_string()[..]).into()  })
+                    if let Some(ref inner) = rec.maybe_unique_id {
+                        Some((&inner.to_string()[..]).into())
+                    } else {
+                        None
+                    }
                 }).collect();
 
                 if let parquet::column::writer::ColumnWriter::ByteArrayColumnWriter(ref mut typed) = column_writer {
@@ -916,5 +1091,24 @@ mod test {
                 }
             }
         }).to_string());
+    }
+
+    #[test]
+    fn test_converted_type() {
+        let snippet: proc_macro2::TokenStream = quote! {
+          struct ATimeStruct {
+            time: chrono::NaiveDateTime,
+          }
+        };
+
+        let fields = extract_fields(snippet);
+
+        let time = Field::from(&fields[0]);
+
+        let converted_type = time.ty.converted_type();
+        assert_eq!(
+            converted_type.unwrap().to_string(),
+            quote! { ConvertedType::TIMESTAMP_MILLIS }.to_string()
+        );
     }
 }

@@ -190,7 +190,7 @@ impl IpcDataGenerator {
         for array in batch.columns() {
             let array_data = array.data();
             offset = write_array_data(
-                &array_data,
+                array_data,
                 &mut buffers,
                 &mut arrow_data,
                 &mut nodes,
@@ -243,7 +243,7 @@ impl IpcDataGenerator {
         let mut arrow_data: Vec<u8> = vec![];
 
         write_array_data(
-            &array_data,
+            array_data,
             &mut buffers,
             &mut arrow_data,
             &mut nodes,
@@ -628,7 +628,7 @@ pub fn write_message<W: Write>(
 
     write_continuation(
         &mut writer,
-        &write_options,
+        write_options,
         (aligned_size - prefix_size) as i32,
     )?;
 
@@ -928,6 +928,7 @@ mod tests {
             "generated_interval",
             "generated_datetime",
             "generated_dictionary",
+            "generated_map",
             "generated_nested",
             "generated_primitive_no_batches",
             "generated_primitive_zerolength",
@@ -979,6 +980,7 @@ mod tests {
             "generated_interval",
             "generated_datetime",
             "generated_dictionary",
+            "generated_map",
             "generated_nested",
             "generated_primitive_no_batches",
             "generated_primitive_zerolength",
@@ -1031,6 +1033,7 @@ mod tests {
             "generated_dictionary",
             // "generated_duplicate_fieldnames",
             "generated_interval",
+            "generated_map",
             "generated_nested",
             // "generated_nested_large_offsets",
             "generated_null_trivial",
@@ -1094,6 +1097,7 @@ mod tests {
             "generated_dictionary",
             // "generated_duplicate_fieldnames",
             "generated_interval",
+            "generated_map",
             "generated_nested",
             // "generated_nested_large_offsets",
             "generated_null_trivial",
