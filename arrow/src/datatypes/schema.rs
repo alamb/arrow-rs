@@ -34,9 +34,9 @@ use super::Field;
 pub struct Schema {
     pub(crate) fields: Vec<Field>,
     /// A map of key-value pairs containing additional meta data.
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
-    pub(crate) metadata: HashMap<String, String>,
+    pub(crate) metadata: Option<HashMap<String, String>>,
 }
 
 impl Schema {
@@ -44,7 +44,7 @@ impl Schema {
     pub fn empty() -> Self {
         Self {
             fields: vec![],
-            metadata: HashMap::new(),
+            metadata: None,
         }
     }
 
@@ -60,37 +60,34 @@ impl Schema {
     /// let schema = Schema::new(vec![field_a, field_b]);
     /// ```
     pub fn new(fields: Vec<Field>) -> Self {
-        Self::new_with_metadata(fields, HashMap::new())
+        Self {
+            fields,
+            ..Self::empty()
+        }
     }
 
-    /// Creates a new `Schema` from a sequence of `Field` values
-    /// and adds additional metadata in form of key value pairs.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use arrow::datatypes::{Field, DataType, Schema};
-    /// # use std::collections::HashMap;
-    /// let field_a = Field::new("a", DataType::Int64, false);
-    /// let field_b = Field::new("b", DataType::Boolean, false);
-    ///
-    /// let mut metadata: HashMap<String, String> = HashMap::new();
-    /// metadata.insert("row_count".to_string(), "100".to_string());
-    ///
-    /// let schema = Schema::new_with_metadata(vec![field_a, field_b], metadata);
-    /// ```
-    #[inline]
-    pub const fn new_with_metadata(
-        fields: Vec<Field>,
-        metadata: HashMap<String, String>,
-    ) -> Self {
-        Self { fields, metadata }
-    }
 
     /// Sets the metadata of this `Schema` to be `metadata` and returns self
-    pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
-        self.metadata = metadata;
+    pub fn with_metadata(mut self, metadata: Option<HashMap<String, String>>) -> Self {
+        // To make serde happy, convert Some(empty_map) to None.
+        self.metadata = None;
+        if let Some(v) = metadata {
+            if !v.is_empty() {
+                self.metadata = Some(v);
+            }
+        }
         self
+    }
+
+    /// Inserts key=value into the metadata of this schema, returning
+    /// the previous value, if any
+    pub fn insert_metadata_value(&mut self, key: impl Into<String>, value: impl Into<String>) -> Option<String> {
+        let mut metadata = self.metadata
+            .take()
+            .unwrap_or_else(|| HashMap::new() );
+        let prev = metadata.insert(key.into(), value.into());
+        self.metadata = Some(metadata);
+        prev
     }
 
     /// Returns a new schema with only the specified columns in the new schema
@@ -108,7 +105,7 @@ impl Schema {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self::new_with_metadata(new_fields, self.metadata.clone()))
+        Ok(Self::new(new_fields).with_metadata(self.metadata.clone()))
     }
 
     /// Merge schema into self if it is compatible. Struct fields will be merged recursively.
@@ -144,17 +141,19 @@ impl Schema {
             .into_iter()
             .try_fold(Self::empty(), |mut merged, schema| {
                 let Schema { metadata, fields } = schema;
-                for (key, value) in metadata.into_iter() {
-                    // merge metadata
-                    if let Some(old_val) = merged.metadata.get(&key) {
-                        if old_val != &value {
-                            return Err(ArrowError::SchemaError(
-                                "Fail to merge schema due to conflicting metadata."
-                                    .to_string(),
-                            ));
+                if let Some(metadata) = metadata {
+                    for (key, value) in metadata.into_iter() {
+                        // merge metadata
+                        if let Some(old_val) = merged.metadata.and_then(|metadata| metadata.get(&key)) {
+                            if old_val != &value {
+                                return Err(ArrowError::SchemaError(
+                                    "Fail to merge schema due to conflicting metadata."
+                                        .to_string(),
+                                ));
+                            }
                         }
+                        merged.insert_metadata_value(key, value);
                     }
-                    merged.metadata.insert(key, value);
                 }
                 // merge fields
                 for field in fields.into_iter() {
@@ -223,10 +222,10 @@ impl Schema {
         )))
     }
 
-    /// Returns an immutable reference to the Map of custom metadata key-value pairs.
+    /// Returns an immutable reference to the Map of custom metadata key-value pairs, if any
     #[inline]
-    pub const fn metadata(&self) -> &HashMap<String, String> {
-        &self.metadata
+    pub const fn metadata(&self) -> Option<&HashMap<String, String>> {
+        self.metadata.as_ref()
     }
 
     /// Look up a column by name and return a immutable reference to the column along with
@@ -264,7 +263,7 @@ impl Schema {
                     HashMap::default()
                 };
 
-                Ok(Self { fields, metadata })
+                Ok(Self::new(fields).with_metadata(Some(metadata)))
             }
             _ => Err(ArrowError::ParseError(
                 "Invalid json value type for schema".to_string(),

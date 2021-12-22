@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use serde_derive::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -36,7 +36,7 @@ pub struct Field {
     dict_is_ordered: bool,
     /// A map of key-value pairs containing additional custom meta data.
     #[serde(skip_serializing_if = "Option::is_none")]
-    metadata: Option<BTreeMap<String, String>>,
+    metadata: Option<HashMap<String, String>>,
 }
 
 impl Field {
@@ -70,10 +70,10 @@ impl Field {
         }
     }
 
-    /// Sets the `Field`'s optional custom metadata.
+    /// Sets the `Field`'s optional custom metadata, and returns self
     /// The metadata is set as `None` for empty map.
     #[inline]
-    pub fn set_metadata(&mut self, metadata: Option<BTreeMap<String, String>>) {
+    pub fn with_metadata(mut self, metadata: Option<HashMap<String, String>>) -> Self {
         // To make serde happy, convert Some(empty_map) to None.
         self.metadata = None;
         if let Some(v) = metadata {
@@ -81,17 +81,12 @@ impl Field {
                 self.metadata = Some(v);
             }
         }
-    }
-
-    /// Sets the metadata of this `Field` to be `metadata` and returns self
-    pub fn with_metadata(mut self, metadata: Option<BTreeMap<String, String>>) -> Self {
-        self.set_metadata(metadata);
         self
     }
 
     /// Returns the immutable reference to the `Field`'s optional custom metadata.
     #[inline]
-    pub const fn metadata(&self) -> &Option<BTreeMap<String, String>> {
+    pub const fn metadata(&self) -> &Option<HashMap<String, String>> {
         &self.metadata
     }
 
@@ -193,7 +188,7 @@ impl Field {
                 // Referenced example file: testing/data/arrow-ipc-stream/integration/1.0.0-littleendian/generated_custom_metadata.json.gz
                 let metadata = match map.get("metadata") {
                     Some(&Value::Array(ref values)) => {
-                        let mut res: BTreeMap<String, String> = BTreeMap::new();
+                        let mut res: HashMap<String, String> = HashMap::new();
                         for value in values {
                             match value.as_object() {
                                 Some(map) => {
@@ -231,7 +226,7 @@ impl Field {
                     // We also support map format, because Schema's metadata supports this.
                     // See https://github.com/apache/arrow/pull/5907
                     Some(&Value::Object(ref values)) => {
-                        let mut res: BTreeMap<String, String> = BTreeMap::new();
+                        let mut res: HashMap<String, String> = HashMap::new();
                         for (k, v) in values {
                             if let Some(str_value) = v.as_str() {
                                 res.insert(k.clone(), str_value.to_string().clone());
@@ -434,24 +429,24 @@ impl Field {
     /// ```
     pub fn try_merge(&mut self, from: &Field) -> Result<()> {
         // merge metadata
-        match (self.metadata(), from.metadata()) {
+        match (self.metadata.take(), from.metadata().clone().take()) {
             (Some(self_metadata), Some(from_metadata)) => {
-                let mut merged = self_metadata.clone();
+                let mut merged = self_metadata;
                 for (key, from_value) in from_metadata {
-                    if let Some(self_value) = self_metadata.get(key) {
-                        if self_value != from_value {
+                    if let Some(self_value) = self_metadata.get(&key) {
+                        if self_value != &from_value {
                             return Err(ArrowError::SchemaError(format!(
                                 "Fail to merge field due to conflicting metadata data value for key {}", key),
                             ));
                         }
                     } else {
-                        merged.insert(key.clone(), from_value.clone());
+                        merged.insert(key, from_value);
                     }
                 }
-                self.set_metadata(Some(merged));
+                self.metadata = Some(merged);
             }
             (None, Some(from_metadata)) => {
-                self.set_metadata(Some(from_metadata.clone()));
+                self.metadata = Some(from_metadata);
             }
             _ => {}
         }

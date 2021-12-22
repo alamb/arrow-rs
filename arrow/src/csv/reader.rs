@@ -486,7 +486,7 @@ impl<R: Read> Iterator for Reader<R> {
         let result = parse(
             &self.batch_records[..read_records],
             self.schema.fields(),
-            Some(self.schema.metadata.clone()),
+            self.schema.metadata.clone(),
             &self.projection,
             self.line_number,
         );
@@ -628,7 +628,7 @@ fn parse(
 
     let projected_schema = Arc::new(match metadata {
         None => Schema::new(projected_fields),
-        Some(metadata) => Schema::new_with_metadata(projected_fields, metadata),
+        Some(metadata) => Schema::new(projected_fields).with_metadata(Some(metadata)),
     });
 
     arrays.and_then(|arr| RecordBatch::try_new(projected_schema, arr))
