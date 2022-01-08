@@ -464,10 +464,11 @@ impl MutableBuffer {
     /// # Safety
     /// This method assumes that the iterator's size is correct and is undefined behavior
     /// to use it on an iterator that reports an incorrect length.
-    // This implementation is required for two reasons:
-    // 1. there is no trait `TrustedLen` in stable rust and therefore
-    //    we can't specialize `extend` for `TrustedLen` like `Vec` does.
-    // 2. `from_trusted_len_iter_bool` is faster.
+    ///
+    /// This implementation is required for two reasons:
+    /// 1. there is no trait `TrustedLen` in stable rust and therefore
+    ///    we can't specialize `extend` for `TrustedLen` like `Vec` does.
+    /// 2. `from_trusted_len_iter_bool` is faster.
     #[inline]
     pub unsafe fn from_trusted_len_iter_bool<I: Iterator<Item = bool>>(
         mut iterator: I,
@@ -475,10 +476,8 @@ impl MutableBuffer {
         let (_, upper) = iterator.size_hint();
         let upper = upper.expect("from_trusted_len_iter requires an upper limit");
 
-        let mut result = {
-            let byte_capacity: usize = upper.saturating_add(7) / 8;
-            MutableBuffer::new(byte_capacity)
-        };
+        let byte_capacity: usize = upper.saturating_add(7) / 8;
+        let mut result = MutableBuffer::new(byte_capacity);
 
         'a: loop {
             let mut byte_accum: u8 = 0;
@@ -504,6 +503,9 @@ impl MutableBuffer {
             // Soundness: from_trusted_len
             result.push_unchecked(byte_accum);
         }
+        assert_eq!(result.len(), byte_capacity,
+            "Trusted iterator length was not accurately reported"
+        );
         result
     }
 

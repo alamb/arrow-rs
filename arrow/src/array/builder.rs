@@ -266,6 +266,7 @@ impl<T: ArrowNativeType> BufferBuilder<T> {
     /// the iterator implement `TrustedLen` once that is stabilized.
     #[inline]
     pub unsafe fn append_trusted_len_iter(&mut self, iter: impl IntoIterator<Item = T>) {
+        // Not sure what about this is unsafe
         let iter = iter.into_iter();
         let len = iter
             .size_hint()
