@@ -1713,6 +1713,22 @@ mod tests {
     }
 
     #[test]
+    fn test_bitmap_too_small_invalid() {
+        let buffer = make_i32_buffer(9);
+        let null_bit_buffer = Buffer::from(vec![0b11111111]);
+
+        ArrayData::try_new(
+            DataType::Int32,
+            9,
+            Some(1), // OUT-OF-BOUNDS READ
+            Some(null_bit_buffer),
+            0,
+            vec![buffer],
+            vec![],
+        )
+        .unwrap();
+    }
+    #[test]
     #[should_panic(expected = "null_count 3 for an array exceeds length of 2 elements")]
     fn test_bad_null_count() {
         let buffer = Buffer::from_slice_ref(&[0i32, 2i32]);
