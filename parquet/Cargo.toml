@@ -17,7 +17,7 @@
 
 [package]
 name = "parquet"
-version = "0.18.0"
+version = "0.18.1"
 license = "Apache-2.0"
 description = "Apache Parquet implementation in Rust"
 homepage = "https://github.com/apache/arrow-rs"
@@ -63,7 +63,6 @@ arrow = { path = "../arrow", version = "0.18.0", default-features = false, featu
 
 [package.metadata.docs.rs]
 all-features = true
-rustdoc-args = ["--cfg", "doc_cfg"]
 
 [features]
 default = ["arrow", "snap", "brotli", "flate2", "lz4", "zstd", "base64"]
