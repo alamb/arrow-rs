@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 
 use serde_derive::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -27,7 +29,7 @@ use super::DataType;
 /// Contains the meta-data for a single relative type.
 ///
 /// The `Schema` object is an ordered collection of `Field` objects.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Field {
     name: String,
     data_type: DataType,
@@ -37,6 +39,47 @@ pub struct Field {
     /// A map of key-value pairs containing additional custom meta data.
     #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<BTreeMap<String, String>>,
+}
+
+// Auto-derive `PartialEq` traits will pull `dict_id` and `dict_is_ordered`
+// into comparison. However, these properties are only used in IPC context
+// for matching dictionary encoded data. They are not necessary to be same
+// to consider schema equality. For example, in C++ `Field` implementation,
+// it doesn't contain these dictionary properties too.
+impl PartialEq for Field {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.data_type == other.data_type
+            && self.nullable == other.nullable
+            && self.metadata == other.metadata
+    }
+}
+
+impl Eq for Field {}
+
+impl PartialOrd for Field {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Field {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.name
+            .cmp(other.name())
+            .then(self.data_type.cmp(other.data_type()))
+            .then(self.nullable.cmp(&other.nullable))
+            .then(self.metadata.cmp(&other.metadata))
+    }
+}
+
+impl Hash for Field {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.data_type.hash(state);
+        self.nullable.hash(state);
+        self.metadata.hash(state);
+    }
 }
 
 impl Field {
@@ -83,10 +126,16 @@ impl Field {
         }
     }
 
+    /// Sets the metadata of this `Field` to be `metadata` and returns self
+    pub fn with_metadata(mut self, metadata: Option<BTreeMap<String, String>>) -> Self {
+        self.set_metadata(metadata);
+        self
+    }
+
     /// Returns the immutable reference to the `Field`'s optional custom metadata.
     #[inline]
-    pub const fn metadata(&self) -> &Option<BTreeMap<String, String>> {
-        &self.metadata
+    pub const fn metadata(&self) -> Option<&BTreeMap<String, String>> {
+        self.metadata.as_ref()
     }
 
     /// Returns an immutable reference to the `Field`'s name.
@@ -105,6 +154,47 @@ impl Field {
     #[inline]
     pub const fn is_nullable(&self) -> bool {
         self.nullable
+    }
+
+    /// Returns a (flattened) vector containing all fields contained within this field (including it self)
+    pub(crate) fn fields(&self) -> Vec<&Field> {
+        let mut collected_fields = vec![self];
+        collected_fields.append(&mut self._fields(&self.data_type));
+
+        collected_fields
+    }
+
+    fn _fields<'a>(&'a self, dt: &'a DataType) -> Vec<&Field> {
+        let mut collected_fields = vec![];
+
+        match dt {
+            DataType::Struct(fields) | DataType::Union(fields, _, _) => {
+                collected_fields.extend(fields.iter().flat_map(|f| f.fields()))
+            }
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::FixedSizeList(field, _)
+            | DataType::Map(field, _) => collected_fields.extend(field.fields()),
+            DataType::Dictionary(_, value_field) => {
+                collected_fields.append(&mut self._fields(value_field.as_ref()))
+            }
+            _ => (),
+        }
+
+        collected_fields
+    }
+
+    /// Returns a vector containing all (potentially nested) `Field` instances selected by the
+    /// dictionary ID they use
+    #[inline]
+    pub(crate) fn fields_with_dict_id(&self, id: i64) -> Vec<&Field> {
+        self.fields()
+            .into_iter()
+            .filter(|&field| {
+                matches!(field.data_type(), DataType::Dictionary(_, _))
+                    && field.dict_id == id
+            })
+            .collect()
     }
 
     /// Returns the dictionary ID, if this is a dictionary type.
@@ -256,7 +346,7 @@ impl Field {
                     DataType::Struct(mut fields) => match map.get("children") {
                         Some(Value::Array(values)) => {
                             let struct_fields: Result<Vec<Field>> =
-                                values.iter().map(|v| Field::from(v)).collect();
+                                values.iter().map(Field::from).collect();
                             fields.append(&mut struct_fields?);
                             DataType::Struct(fields)
                         }
@@ -300,6 +390,23 @@ impl Field {
                             }
                         }
                     }
+                    DataType::Union(_, type_ids, mode) => match map.get("children") {
+                        Some(Value::Array(values)) => {
+                            let union_fields: Vec<Field> =
+                                values.iter().map(Field::from).collect::<Result<_>>()?;
+                            DataType::Union(union_fields, type_ids, mode)
+                        }
+                        Some(_) => {
+                            return Err(ArrowError::ParseError(
+                                "Field 'children' must be an array".to_string(),
+                            ))
+                        }
+                        None => {
+                            return Err(ArrowError::ParseError(
+                                "Field missing 'children' attribute".to_string(),
+                            ));
+                        }
+                    },
                     _ => data_type,
                 };
 
@@ -454,18 +561,34 @@ impl Field {
                     ));
                 }
             },
-            DataType::Union(nested_fields) => match &from.data_type {
-                DataType::Union(from_nested_fields) => {
-                    for from_field in from_nested_fields {
+            DataType::Union(nested_fields, type_ids, _) => match &from.data_type {
+                DataType::Union(from_nested_fields, from_type_ids, _) => {
+                    for (idx, from_field) in from_nested_fields.iter().enumerate() {
                         let mut is_new_field = true;
-                        for self_field in nested_fields.iter_mut() {
+                        let field_type_id = from_type_ids.get(idx).unwrap();
+
+                        for (self_idx, self_field) in nested_fields.iter_mut().enumerate()
+                        {
                             if from_field == self_field {
+                                let self_type_id = type_ids.get(self_idx).unwrap();
+
+                                // If the nested fields in two unions are the same, they must have same
+                                // type id.
+                                if self_type_id != field_type_id {
+                                    return Err(ArrowError::SchemaError(
+                                        "Fail to merge schema Field due to conflicting type ids in union datatype"
+                                            .to_string(),
+                                    ));
+                                }
+
                                 is_new_field = false;
                                 break;
                             }
                         }
+
                         if is_new_field {
                             nested_fields.push(from_field.clone());
+                            type_ids.push(*field_type_id);
                         }
                     }
                 }
@@ -570,5 +693,104 @@ impl Field {
 impl std::fmt::Display for Field {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{:?}", self)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{DataType, Field};
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    #[test]
+    fn test_fields_with_dict_id() {
+        let dict1 = Field::new_dict(
+            "dict1",
+            DataType::Dictionary(DataType::Utf8.into(), DataType::Int32.into()),
+            false,
+            10,
+            false,
+        );
+        let dict2 = Field::new_dict(
+            "dict2",
+            DataType::Dictionary(DataType::Int32.into(), DataType::Int8.into()),
+            false,
+            20,
+            false,
+        );
+
+        let field = Field::new(
+            "struct<dict1, list[struct<dict2, list[struct<dict1]>]>",
+            DataType::Struct(vec![
+                dict1.clone(),
+                Field::new(
+                    "list[struct<dict1, list[struct<dict2>]>]",
+                    DataType::List(Box::new(Field::new(
+                        "struct<dict1, list[struct<dict2>]>",
+                        DataType::Struct(vec![
+                            dict1.clone(),
+                            Field::new(
+                                "list[struct<dict2>]",
+                                DataType::List(Box::new(Field::new(
+                                    "struct<dict2>",
+                                    DataType::Struct(vec![dict2.clone()]),
+                                    false,
+                                ))),
+                                false,
+                            ),
+                        ]),
+                        false,
+                    ))),
+                    false,
+                ),
+            ]),
+            false,
+        );
+
+        for field in field.fields_with_dict_id(10) {
+            assert_eq!(dict1, *field);
+        }
+        for field in field.fields_with_dict_id(20) {
+            assert_eq!(dict2, *field);
+        }
+    }
+
+    fn get_field_hash(field: &Field) -> u64 {
+        let mut s = DefaultHasher::new();
+        field.hash(&mut s);
+        s.finish()
+    }
+
+    #[test]
+    fn test_field_comparison_case() {
+        // dictionary-encoding properties not used for field comparison
+        let dict1 = Field::new_dict(
+            "dict1",
+            DataType::Dictionary(DataType::Utf8.into(), DataType::Int32.into()),
+            false,
+            10,
+            false,
+        );
+        let dict2 = Field::new_dict(
+            "dict1",
+            DataType::Dictionary(DataType::Utf8.into(), DataType::Int32.into()),
+            false,
+            20,
+            false,
+        );
+
+        assert_eq!(dict1, dict2);
+        assert_eq!(get_field_hash(&dict1), get_field_hash(&dict2));
+
+        let dict1 = Field::new_dict(
+            "dict0",
+            DataType::Dictionary(DataType::Utf8.into(), DataType::Int32.into()),
+            false,
+            10,
+            false,
+        );
+
+        assert_ne!(dict1, dict2);
+        assert_ne!(get_field_hash(&dict1), get_field_hash(&dict2));
     }
 }

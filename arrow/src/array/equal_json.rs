@@ -251,7 +251,7 @@ impl PartialEq<MapArray> for Value {
     }
 }
 
-impl<OffsetSize: BinaryOffsetSizeTrait> JsonEqual for GenericBinaryArray<OffsetSize> {
+impl<OffsetSize: OffsetSizeTrait> JsonEqual for GenericBinaryArray<OffsetSize> {
     fn equals_json(&self, json: &[&Value]) -> bool {
         if self.len() != json.len() {
             return false;
@@ -271,9 +271,7 @@ impl<OffsetSize: BinaryOffsetSizeTrait> JsonEqual for GenericBinaryArray<OffsetS
     }
 }
 
-impl<OffsetSize: BinaryOffsetSizeTrait> PartialEq<Value>
-    for GenericBinaryArray<OffsetSize>
-{
+impl<OffsetSize: OffsetSizeTrait> PartialEq<Value> for GenericBinaryArray<OffsetSize> {
     fn eq(&self, json: &Value) -> bool {
         match json {
             Value::Array(json_array) => self.equals_json_values(json_array),
@@ -282,9 +280,7 @@ impl<OffsetSize: BinaryOffsetSizeTrait> PartialEq<Value>
     }
 }
 
-impl<OffsetSize: BinaryOffsetSizeTrait> PartialEq<GenericBinaryArray<OffsetSize>>
-    for Value
-{
+impl<OffsetSize: OffsetSizeTrait> PartialEq<GenericBinaryArray<OffsetSize>> for Value {
     fn eq(&self, arrow: &GenericBinaryArray<OffsetSize>) -> bool {
         match self {
             Value::Array(json_array) => arrow.equals_json_values(json_array),
@@ -293,7 +289,7 @@ impl<OffsetSize: BinaryOffsetSizeTrait> PartialEq<GenericBinaryArray<OffsetSize>
     }
 }
 
-impl<OffsetSize: StringOffsetSizeTrait> JsonEqual for GenericStringArray<OffsetSize> {
+impl<OffsetSize: OffsetSizeTrait> JsonEqual for GenericStringArray<OffsetSize> {
     fn equals_json(&self, json: &[&Value]) -> bool {
         if self.len() != json.len() {
             return false;
@@ -307,9 +303,7 @@ impl<OffsetSize: StringOffsetSizeTrait> JsonEqual for GenericStringArray<OffsetS
     }
 }
 
-impl<OffsetSize: StringOffsetSizeTrait> PartialEq<Value>
-    for GenericStringArray<OffsetSize>
-{
+impl<OffsetSize: OffsetSizeTrait> PartialEq<Value> for GenericStringArray<OffsetSize> {
     fn eq(&self, json: &Value) -> bool {
         match json {
             Value::Array(json_array) => self.equals_json_values(json_array),
@@ -318,9 +312,7 @@ impl<OffsetSize: StringOffsetSizeTrait> PartialEq<Value>
     }
 }
 
-impl<OffsetSize: StringOffsetSizeTrait> PartialEq<GenericStringArray<OffsetSize>>
-    for Value
-{
+impl<OffsetSize: OffsetSizeTrait> PartialEq<GenericStringArray<OffsetSize>> for Value {
     fn eq(&self, arrow: &GenericStringArray<OffsetSize>) -> bool {
         match self {
             Value::Array(json_array) => arrow.equals_json_values(json_array),
@@ -378,7 +370,7 @@ impl JsonEqual for DecimalArray {
                 self.is_valid(i)
                     && (s
                         .parse::<i128>()
-                        .map_or_else(|_| false, |v| v == self.value(i)))
+                        .map_or_else(|_| false, |v| v == self.value(i).as_i128()))
             }
             JNull => self.is_null(i),
             _ => false,
@@ -438,6 +430,12 @@ impl PartialEq<Value> for NullArray {
             Value::Array(json_array) => self.equals_json_values(json_array),
             _ => false,
         }
+    }
+}
+
+impl JsonEqual for ArrayRef {
+    fn equals_json(&self, json: &[&Value]) -> bool {
+        self.as_ref().equals_json(json)
     }
 }
 
@@ -931,11 +929,11 @@ mod tests {
     #[test]
     fn test_decimal_json_equal() {
         // Test the equal case
-        let mut builder = DecimalBuilder::new(30, 23, 6);
-        builder.append_value(1_000).unwrap();
-        builder.append_null().unwrap();
-        builder.append_value(-250).unwrap();
-        let arrow_array: DecimalArray = builder.finish();
+        let arrow_array = [Some(1_000), None, Some(-250)]
+            .iter()
+            .collect::<DecimalArray>()
+            .with_precision_and_scale(23, 6)
+            .unwrap();
         let json_array: Value = serde_json::from_str(
             r#"
             [
@@ -950,10 +948,11 @@ mod tests {
         assert!(json_array.eq(&arrow_array));
 
         // Test unequal case
-        builder.append_value(1_000).unwrap();
-        builder.append_null().unwrap();
-        builder.append_value(55).unwrap();
-        let arrow_array: DecimalArray = builder.finish();
+        let arrow_array = [Some(1_000), None, Some(55)]
+            .iter()
+            .collect::<DecimalArray>()
+            .with_precision_and_scale(23, 6)
+            .unwrap();
         let json_array: Value = serde_json::from_str(
             r#"
             [

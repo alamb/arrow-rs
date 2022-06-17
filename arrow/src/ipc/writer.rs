@@ -25,7 +25,10 @@ use std::io::{BufWriter, Write};
 
 use flatbuffers::FlatBufferBuilder;
 
-use crate::array::{ArrayData, ArrayRef};
+use crate::array::{
+    as_large_list_array, as_list_array, as_map_array, as_struct_array, as_union_array,
+    make_array, Array, ArrayData, ArrayRef, FixedSizeListArray,
+};
 use crate::buffer::{Buffer, MutableBuffer};
 use crate::datatypes::*;
 use crate::error::{ArrowError, Result};
@@ -36,7 +39,7 @@ use crate::util::bit_util;
 use ipc::CONTINUATION_MARKER;
 
 /// IPC write options used to control the behaviour of the writer
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IpcWriteOptions {
     /// Write padding after memory buffers to this multiple of bytes.
     /// Generally 8 or 64, defaults to 8
@@ -137,25 +140,133 @@ impl IpcDataGenerator {
         }
     }
 
-    pub fn encoded_batch(
+    fn _encode_dictionaries(
         &self,
-        batch: &RecordBatch,
+        column: &ArrayRef,
+        encoded_dictionaries: &mut Vec<EncodedData>,
         dictionary_tracker: &mut DictionaryTracker,
         write_options: &IpcWriteOptions,
-    ) -> Result<(Vec<EncodedData>, EncodedData)> {
-        // TODO: handle nested dictionaries
-        let schema = batch.schema();
-        let mut encoded_dictionaries = Vec::with_capacity(schema.fields().len());
+    ) -> Result<()> {
+        match column.data_type() {
+            DataType::Struct(fields) => {
+                let s = as_struct_array(column);
+                for (field, &column) in fields.iter().zip(s.columns().iter()) {
+                    self.encode_dictionaries(
+                        field,
+                        column,
+                        encoded_dictionaries,
+                        dictionary_tracker,
+                        write_options,
+                    )?;
+                }
+            }
+            DataType::List(field) => {
+                let list = as_list_array(column);
+                self.encode_dictionaries(
+                    field,
+                    &list.values(),
+                    encoded_dictionaries,
+                    dictionary_tracker,
+                    write_options,
+                )?;
+            }
+            DataType::LargeList(field) => {
+                let list = as_large_list_array(column);
+                self.encode_dictionaries(
+                    field,
+                    &list.values(),
+                    encoded_dictionaries,
+                    dictionary_tracker,
+                    write_options,
+                )?;
+            }
+            DataType::FixedSizeList(field, _) => {
+                let list = column
+                    .as_any()
+                    .downcast_ref::<FixedSizeListArray>()
+                    .expect("Unable to downcast to fixed size list array");
+                self.encode_dictionaries(
+                    field,
+                    &list.values(),
+                    encoded_dictionaries,
+                    dictionary_tracker,
+                    write_options,
+                )?;
+            }
+            DataType::Map(field, _) => {
+                let map_array = as_map_array(column);
 
-        for (i, field) in schema.fields().iter().enumerate() {
-            let column = batch.column(i);
+                let (keys, values) = match field.data_type() {
+                    DataType::Struct(fields) if fields.len() == 2 => {
+                        (&fields[0], &fields[1])
+                    }
+                    _ => panic!("Incorrect field data type {:?}", field.data_type()),
+                };
 
-            if let DataType::Dictionary(_key_type, _value_type) = column.data_type() {
+                // keys
+                self.encode_dictionaries(
+                    keys,
+                    &map_array.keys(),
+                    encoded_dictionaries,
+                    dictionary_tracker,
+                    write_options,
+                )?;
+
+                // values
+                self.encode_dictionaries(
+                    values,
+                    &map_array.values(),
+                    encoded_dictionaries,
+                    dictionary_tracker,
+                    write_options,
+                )?;
+            }
+            DataType::Union(fields, _, _) => {
+                let union = as_union_array(column);
+                for (field, ref column) in fields
+                    .iter()
+                    .enumerate()
+                    .map(|(n, f)| (f, union.child(n as i8)))
+                {
+                    self.encode_dictionaries(
+                        field,
+                        column,
+                        encoded_dictionaries,
+                        dictionary_tracker,
+                        write_options,
+                    )?;
+                }
+            }
+            _ => (),
+        }
+
+        Ok(())
+    }
+
+    fn encode_dictionaries(
+        &self,
+        field: &Field,
+        column: &ArrayRef,
+        encoded_dictionaries: &mut Vec<EncodedData>,
+        dictionary_tracker: &mut DictionaryTracker,
+        write_options: &IpcWriteOptions,
+    ) -> Result<()> {
+        match column.data_type() {
+            DataType::Dictionary(_key_type, _value_type) => {
                 let dict_id = field
                     .dict_id()
                     .expect("All Dictionary types have `dict_id`");
                 let dict_data = column.data();
                 let dict_values = &dict_data.child_data()[0];
+
+                let values = make_array(dict_data.child_data()[0].clone());
+
+                self._encode_dictionaries(
+                    &values,
+                    encoded_dictionaries,
+                    dictionary_tracker,
+                    write_options,
+                )?;
 
                 let emit = dictionary_tracker.insert(dict_id, column)?;
 
@@ -167,10 +278,38 @@ impl IpcDataGenerator {
                     ));
                 }
             }
+            _ => self._encode_dictionaries(
+                column,
+                encoded_dictionaries,
+                dictionary_tracker,
+                write_options,
+            )?,
+        }
+
+        Ok(())
+    }
+
+    pub fn encoded_batch(
+        &self,
+        batch: &RecordBatch,
+        dictionary_tracker: &mut DictionaryTracker,
+        write_options: &IpcWriteOptions,
+    ) -> Result<(Vec<EncodedData>, EncodedData)> {
+        let schema = batch.schema();
+        let mut encoded_dictionaries = Vec::with_capacity(schema.all_fields().len());
+
+        for (i, field) in schema.fields().iter().enumerate() {
+            let column = batch.column(i);
+            self.encode_dictionaries(
+                field,
+                column,
+                &mut encoded_dictionaries,
+                dictionary_tracker,
+                write_options,
+            )?;
         }
 
         let encoded_message = self.record_batch_to_bytes(batch, write_options);
-
         Ok((encoded_dictionaries, encoded_message))
     }
 
@@ -197,6 +336,7 @@ impl IpcDataGenerator {
                 offset,
                 array.len(),
                 array.null_count(),
+                write_options,
             );
         }
 
@@ -250,6 +390,7 @@ impl IpcDataGenerator {
             0,
             array_data.len(),
             array_data.null_count(),
+            write_options,
         );
 
         // write data
@@ -467,6 +608,18 @@ impl<W: Write> FileWriter<W> {
 
         Ok(())
     }
+
+    /// Unwraps the BufWriter housed in FileWriter.writer, returning the underlying
+    /// writer
+    ///
+    /// The buffer is flushed and the FileWriter is finished before returning the
+    /// writer.
+    pub fn into_inner(mut self) -> Result<W> {
+        if !self.finished {
+            self.finish()?;
+        }
+        self.writer.into_inner().map_err(ArrowError::from)
+    }
 }
 
 pub struct StreamWriter<W: Write> {
@@ -474,8 +627,6 @@ pub struct StreamWriter<W: Write> {
     writer: BufWriter<W>,
     /// IPC write options
     write_options: IpcWriteOptions,
-    /// A reference to the schema, used in validating record batches
-    schema: Schema,
     /// Whether the writer footer has been written, and the writer is finished
     finished: bool,
     /// Keeps track of dictionaries that have been written
@@ -504,7 +655,6 @@ impl<W: Write> StreamWriter<W> {
         Ok(Self {
             writer,
             write_options,
-            schema: schema.clone(),
             finished: false,
             dictionary_tracker: DictionaryTracker::new(false),
             data_gen,
@@ -701,20 +851,37 @@ fn write_continuation<W: Write>(
     Ok(written)
 }
 
+/// In V4, null types have no validity bitmap
+/// In V5 and later, null and union types have no validity bitmap
+fn has_validity_bitmap(data_type: &DataType, write_options: &IpcWriteOptions) -> bool {
+    if write_options.metadata_version < ipc::MetadataVersion::V5 {
+        !matches!(data_type, DataType::Null)
+    } else {
+        !matches!(data_type, DataType::Null | DataType::Union(_, _, _))
+    }
+}
+
 /// Write array data to a vector of bytes
+#[allow(clippy::too_many_arguments)]
 fn write_array_data(
     array_data: &ArrayData,
-    mut buffers: &mut Vec<ipc::Buffer>,
-    mut arrow_data: &mut Vec<u8>,
-    mut nodes: &mut Vec<ipc::FieldNode>,
+    buffers: &mut Vec<ipc::Buffer>,
+    arrow_data: &mut Vec<u8>,
+    nodes: &mut Vec<ipc::FieldNode>,
     offset: i64,
     num_rows: usize,
     null_count: usize,
+    write_options: &IpcWriteOptions,
 ) -> i64 {
     let mut offset = offset;
-    nodes.push(ipc::FieldNode::new(num_rows as i64, null_count as i64));
-    // NullArray does not have any buffers, thus the null buffer is not generated
-    if array_data.data_type() != &DataType::Null {
+    if !matches!(array_data.data_type(), DataType::Null) {
+        nodes.push(ipc::FieldNode::new(num_rows as i64, null_count as i64));
+    } else {
+        // NullArray's null_count equals to len, but the `null_count` passed in is from ArrayData
+        // where null_count is always 0.
+        nodes.push(ipc::FieldNode::new(num_rows as i64, num_rows as i64));
+    }
+    if has_validity_bitmap(array_data.data_type(), write_options) {
         // write null buffer if exists
         let null_buffer = match array_data.null_buffer() {
             None => {
@@ -727,11 +894,11 @@ fn write_array_data(
             Some(buffer) => buffer.clone(),
         };
 
-        offset = write_buffer(&null_buffer, &mut buffers, &mut arrow_data, offset);
+        offset = write_buffer(&null_buffer, buffers, arrow_data, offset);
     }
 
     array_data.buffers().iter().for_each(|buffer| {
-        offset = write_buffer(buffer, &mut buffers, &mut arrow_data, offset);
+        offset = write_buffer(buffer, buffers, arrow_data, offset);
     });
 
     if !matches!(array_data.data_type(), DataType::Dictionary(_, _)) {
@@ -740,12 +907,13 @@ fn write_array_data(
             // write the nested data (e.g list data)
             offset = write_array_data(
                 data_ref,
-                &mut buffers,
-                &mut arrow_data,
-                &mut nodes,
+                buffers,
+                arrow_data,
+                nodes,
                 offset,
                 data_ref.len(),
                 data_ref.null_count(),
+                write_options,
             );
         });
     }
@@ -824,7 +992,7 @@ mod tests {
             let file =
                 File::open(format!("target/debug/testdata/{}.arrow_file", "arrow"))
                     .unwrap();
-            let mut reader = FileReader::try_new(file).unwrap();
+            let mut reader = FileReader::try_new(file, None).unwrap();
             while let Some(Ok(read_batch)) = reader.next() {
                 read_batch
                     .columns()
@@ -872,7 +1040,7 @@ mod tests {
 
         {
             let file = File::open(&file_name).unwrap();
-            let reader = FileReader::try_new(file).unwrap();
+            let reader = FileReader::try_new(file, None).unwrap();
             reader.for_each(|maybe_batch| {
                 maybe_batch
                     .unwrap()
@@ -920,6 +1088,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "force_validate"))]
     fn read_and_rewrite_generated_files_014() {
         let testdata = crate::util::test_util::arrow_test_data();
         let version = "0.14.1";
@@ -942,7 +1111,7 @@ mod tests {
             ))
             .unwrap();
 
-            let mut reader = FileReader::try_new(file).unwrap();
+            let mut reader = FileReader::try_new(file, None).unwrap();
 
             // read and rewrite the file to a temp location
             {
@@ -963,7 +1132,7 @@ mod tests {
                 version, path
             ))
             .unwrap();
-            let mut reader = FileReader::try_new(file).unwrap();
+            let mut reader = FileReader::try_new(file, None).unwrap();
 
             // read expected JSON output
             let arrow_json = read_gzip_json(version, path);
@@ -972,6 +1141,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "force_validate"))]
     fn read_and_rewrite_generated_streams_014() {
         let testdata = crate::util::test_util::arrow_test_data();
         let version = "0.14.1";
@@ -994,7 +1164,7 @@ mod tests {
             ))
             .unwrap();
 
-            let reader = StreamReader::try_new(file).unwrap();
+            let reader = StreamReader::try_new(file, None).unwrap();
 
             // read and rewrite the stream to a temp location
             {
@@ -1013,7 +1183,7 @@ mod tests {
             let file =
                 File::open(format!("target/debug/testdata/{}-{}.stream", version, path))
                     .unwrap();
-            let mut reader = StreamReader::try_new(file).unwrap();
+            let mut reader = StreamReader::try_new(file, None).unwrap();
 
             // read expected JSON output
             let arrow_json = read_gzip_json(version, path);
@@ -1051,7 +1221,7 @@ mod tests {
             ))
             .unwrap();
 
-            let mut reader = FileReader::try_new(file).unwrap();
+            let mut reader = FileReader::try_new(file, None).unwrap();
 
             // read and rewrite the file to a temp location
             {
@@ -1077,7 +1247,7 @@ mod tests {
                 version, path
             ))
             .unwrap();
-            let mut reader = FileReader::try_new(file).unwrap();
+            let mut reader = FileReader::try_new(file, None).unwrap();
 
             // read expected JSON output
             let arrow_json = read_gzip_json(version, path);
@@ -1115,7 +1285,7 @@ mod tests {
             ))
             .unwrap();
 
-            let reader = StreamReader::try_new(file).unwrap();
+            let reader = StreamReader::try_new(file, None).unwrap();
 
             // read and rewrite the stream to a temp location
             {
@@ -1138,7 +1308,7 @@ mod tests {
             let file =
                 File::open(format!("target/debug/testdata/{}-{}.stream", version, path))
                     .unwrap();
-            let mut reader = StreamReader::try_new(file).unwrap();
+            let mut reader = StreamReader::try_new(file, None).unwrap();
 
             // read expected JSON output
             let arrow_json = read_gzip_json(version, path);
@@ -1160,5 +1330,181 @@ mod tests {
         // convert to Arrow JSON
         let arrow_json: ArrowJson = serde_json::from_str(&s).unwrap();
         arrow_json
+    }
+
+    #[test]
+    fn track_union_nested_dict() {
+        let inner: DictionaryArray<Int32Type> = vec!["a", "b", "a"].into_iter().collect();
+
+        let array = Arc::new(inner) as ArrayRef;
+
+        // Dict field with id 2
+        let dctfield =
+            Field::new_dict("dict", array.data_type().clone(), false, 2, false);
+
+        let types = Buffer::from_slice_ref(&[0_i8, 0, 0]);
+        let offsets = Buffer::from_slice_ref(&[0_i32, 1, 2]);
+
+        let union =
+            UnionArray::try_new(&[0], types, Some(offsets), vec![(dctfield, array)])
+                .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "union",
+            union.data_type().clone(),
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(union)]).unwrap();
+
+        let gen = IpcDataGenerator {};
+        let mut dict_tracker = DictionaryTracker::new(false);
+        gen.encoded_batch(&batch, &mut dict_tracker, &Default::default())
+            .unwrap();
+
+        // Dictionary with id 2 should have been written to the dict tracker
+        assert!(dict_tracker.written.contains_key(&2));
+    }
+
+    #[test]
+    fn track_struct_nested_dict() {
+        let inner: DictionaryArray<Int32Type> = vec!["a", "b", "a"].into_iter().collect();
+
+        let array = Arc::new(inner) as ArrayRef;
+
+        // Dict field with id 2
+        let dctfield =
+            Field::new_dict("dict", array.data_type().clone(), false, 2, false);
+
+        let s = StructArray::from(vec![(dctfield, array)]);
+        let struct_array = Arc::new(s) as ArrayRef;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "struct",
+            struct_array.data_type().clone(),
+            false,
+        )]));
+
+        let batch = RecordBatch::try_new(schema, vec![struct_array]).unwrap();
+
+        let gen = IpcDataGenerator {};
+        let mut dict_tracker = DictionaryTracker::new(false);
+        gen.encoded_batch(&batch, &mut dict_tracker, &Default::default())
+            .unwrap();
+
+        // Dictionary with id 2 should have been written to the dict tracker
+        assert!(dict_tracker.written.contains_key(&2));
+    }
+
+    #[test]
+    fn read_union_017() {
+        let testdata = crate::util::test_util::arrow_test_data();
+        let version = "0.17.1";
+        let data_file = File::open(format!(
+            "{}/arrow-ipc-stream/integration/0.17.1/generated_union.stream",
+            testdata,
+        ))
+        .unwrap();
+
+        let reader = StreamReader::try_new(data_file, None).unwrap();
+
+        // read and rewrite the stream to a temp location
+        {
+            let file = File::create(format!(
+                "target/debug/testdata/{}-generated_union.stream",
+                version
+            ))
+            .unwrap();
+            let mut writer = StreamWriter::try_new(file, &reader.schema()).unwrap();
+            reader.for_each(|batch| {
+                writer.write(&batch.unwrap()).unwrap();
+            });
+            writer.finish().unwrap();
+        }
+
+        // Compare original file and rewrote file
+        let file = File::open(format!(
+            "target/debug/testdata/{}-generated_union.stream",
+            version
+        ))
+        .unwrap();
+        let rewrite_reader = StreamReader::try_new(file, None).unwrap();
+
+        let data_file = File::open(format!(
+            "{}/arrow-ipc-stream/integration/0.17.1/generated_union.stream",
+            testdata,
+        ))
+        .unwrap();
+        let reader = StreamReader::try_new(data_file, None).unwrap();
+
+        reader.into_iter().zip(rewrite_reader.into_iter()).for_each(
+            |(batch1, batch2)| {
+                assert_eq!(batch1.unwrap(), batch2.unwrap());
+            },
+        );
+    }
+
+    fn write_union_file(options: IpcWriteOptions) {
+        let schema = Schema::new(vec![Field::new(
+            "union",
+            DataType::Union(
+                vec![
+                    Field::new("a", DataType::Int32, false),
+                    Field::new("c", DataType::Float64, false),
+                ],
+                vec![0, 1],
+                UnionMode::Sparse,
+            ),
+            true,
+        )]);
+        let mut builder = UnionBuilder::new_sparse(5);
+        builder.append::<Int32Type>("a", 1).unwrap();
+        builder.append_null::<Int32Type>("a").unwrap();
+        builder.append::<Float64Type>("c", 3.0).unwrap();
+        builder.append_null::<Float64Type>("c").unwrap();
+        builder.append::<Int32Type>("a", 4).unwrap();
+        let union = builder.build().unwrap();
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(union) as ArrayRef],
+        )
+        .unwrap();
+        let file_name = "target/debug/testdata/union.arrow_file";
+        {
+            let file = File::create(&file_name).unwrap();
+            let mut writer =
+                FileWriter::try_new_with_options(file, &schema, options).unwrap();
+
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        {
+            let file = File::open(&file_name).unwrap();
+            let reader = FileReader::try_new(file, None).unwrap();
+            reader.for_each(|maybe_batch| {
+                maybe_batch
+                    .unwrap()
+                    .columns()
+                    .iter()
+                    .zip(batch.columns())
+                    .for_each(|(a, b)| {
+                        assert_eq!(a.data_type(), b.data_type());
+                        assert_eq!(a.len(), b.len());
+                        assert_eq!(a.null_count(), b.null_count());
+                    });
+            });
+        }
+    }
+
+    #[test]
+    fn test_write_union_file_v4_v5() {
+        write_union_file(
+            IpcWriteOptions::try_new(8, false, MetadataVersion::V4).unwrap(),
+        );
+        write_union_file(
+            IpcWriteOptions::try_new(8, false, MetadataVersion::V5).unwrap(),
+        );
     }
 }

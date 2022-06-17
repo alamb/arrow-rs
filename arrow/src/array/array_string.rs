@@ -27,31 +27,28 @@ use crate::buffer::Buffer;
 use crate::util::bit_util;
 use crate::{buffer::MutableBuffer, datatypes::DataType};
 
-/// Like OffsetSizeTrait, but specialized for Strings
-// This allow us to expose a constant datatype for the GenericStringArray
-pub trait StringOffsetSizeTrait: OffsetSizeTrait {
-    const DATA_TYPE: DataType;
-}
-
-impl StringOffsetSizeTrait for i32 {
-    const DATA_TYPE: DataType = DataType::Utf8;
-}
-
-impl StringOffsetSizeTrait for i64 {
-    const DATA_TYPE: DataType = DataType::LargeUtf8;
-}
-
 /// Generic struct for \[Large\]StringArray
 ///
 /// See [`StringArray`] and [`LargeStringArray`] for storing
 /// specific string data.
-pub struct GenericStringArray<OffsetSize: StringOffsetSizeTrait> {
+pub struct GenericStringArray<OffsetSize: OffsetSizeTrait> {
     data: ArrayData,
     value_offsets: RawPtrBox<OffsetSize>,
     value_data: RawPtrBox<u8>,
 }
 
-impl<OffsetSize: StringOffsetSizeTrait> GenericStringArray<OffsetSize> {
+impl<OffsetSize: OffsetSizeTrait> GenericStringArray<OffsetSize> {
+    /// Get the data type of the array.
+    // Declare this function as `pub const fn` after
+    // https://github.com/rust-lang/rust/issues/93706 is merged.
+    pub fn get_data_type() -> DataType {
+        if OffsetSize::IS_LARGE {
+            DataType::LargeUtf8
+        } else {
+            DataType::Utf8
+        }
+    }
+
     /// Returns the length for the element at index `i`.
     #[inline]
     pub fn value_length(&self, i: usize) -> OffsetSize {
@@ -76,6 +73,15 @@ impl<OffsetSize: StringOffsetSizeTrait> GenericStringArray<OffsetSize> {
     /// Returns a clone of the value data buffer
     pub fn value_data(&self) -> Buffer {
         self.data.buffers()[1].clone()
+    }
+
+    /// Returns the number of `Unicode Scalar Value` in the string at index `i`.
+    /// # Performance
+    /// This function has `O(n)` time complexity where `n` is the string length.
+    /// If you can make sure that all chars in the string are in the range `U+0x0000` ~ `U+0x007F`,
+    /// please use the function [`value_length`](#method.value_length) which has O(1) time complexity.
+    pub fn num_chars(&self, i: usize) -> usize {
+        self.value(i).chars().count()
     }
 
     /// Returns the element at index
@@ -125,50 +131,21 @@ impl<OffsetSize: StringOffsetSizeTrait> GenericStringArray<OffsetSize> {
             "StringArray can only be created from List<u8> arrays, mismatched data types."
         );
 
-        let mut builder = ArrayData::builder(OffsetSize::DATA_TYPE)
+        let builder = ArrayData::builder(Self::get_data_type())
             .len(v.len())
             .add_buffer(v.data().buffers()[0].clone())
-            .add_buffer(v.data().child_data()[0].buffers()[0].clone());
-        if let Some(bitmap) = v.data().null_bitmap() {
-            builder = builder.null_bit_buffer(bitmap.bits.clone())
-        }
+            .add_buffer(v.data().child_data()[0].buffers()[0].clone())
+            .null_bit_buffer(v.data().null_buffer().cloned());
 
         let array_data = unsafe { builder.build_unchecked() };
         Self::from(array_data)
     }
 
-    pub(crate) fn from_vec<Ptr>(v: Vec<Ptr>) -> Self
+    /// Creates a [`GenericStringArray`] based on an iterator of values without nulls
+    pub fn from_iter_values<Ptr, I>(iter: I) -> Self
     where
         Ptr: AsRef<str>,
-    {
-        let mut offsets =
-            MutableBuffer::new((v.len() + 1) * std::mem::size_of::<OffsetSize>());
-        let mut values = MutableBuffer::new(0);
-
-        let mut length_so_far = OffsetSize::zero();
-        offsets.push(length_so_far);
-
-        for s in &v {
-            length_so_far += OffsetSize::from_usize(s.as_ref().len()).unwrap();
-            offsets.push(length_so_far);
-            values.extend_from_slice(s.as_ref().as_bytes());
-        }
-        let array_data = ArrayData::builder(OffsetSize::DATA_TYPE)
-            .len(v.len())
-            .add_buffer(offsets.into())
-            .add_buffer(values.into());
-        let array_data = unsafe { array_data.build_unchecked() };
-        Self::from(array_data)
-    }
-
-    pub(crate) fn from_opt_vec(v: Vec<Option<&str>>) -> Self {
-        v.into_iter().collect()
-    }
-
-    /// Creates a `GenericStringArray` based on an iterator of values without nulls
-    pub fn from_iter_values<Ptr, I: IntoIterator<Item = Ptr>>(iter: I) -> Self
-    where
-        Ptr: AsRef<str>,
+        I: IntoIterator<Item = Ptr>,
     {
         let iter = iter.into_iter();
         let (_, data_len) = iter.size_hint();
@@ -187,16 +164,40 @@ impl<OffsetSize: StringOffsetSizeTrait> GenericStringArray<OffsetSize> {
             offsets.push(length_so_far);
             values.extend_from_slice(s.as_bytes());
         }
-        let array_data = ArrayData::builder(OffsetSize::DATA_TYPE)
-            .len(data_len)
+
+        // iterator size hint may not be correct so compute the actual number of offsets
+        assert!(!offsets.is_empty()); // wrote at least one
+        let actual_len = (offsets.len() / std::mem::size_of::<OffsetSize>()) - 1;
+
+        let array_data = ArrayData::builder(Self::get_data_type())
+            .len(actual_len)
             .add_buffer(offsets.into())
             .add_buffer(values.into());
         let array_data = unsafe { array_data.build_unchecked() };
         Self::from(array_data)
     }
+
+    /// Returns an iterator that returns the values of `array.value(i)` for an iterator with each element `i`
+    pub fn take_iter<'a>(
+        &'a self,
+        indexes: impl Iterator<Item = Option<usize>> + 'a,
+    ) -> impl Iterator<Item = Option<&str>> + 'a {
+        indexes.map(|opt_index| opt_index.map(|index| self.value(index)))
+    }
+
+    /// Returns an iterator that returns the values of `array.value(i)` for an iterator with each element `i`
+    /// # Safety
+    ///
+    /// caller must ensure that the indexes in the iterator are less than the `array.len()`
+    pub unsafe fn take_iter_unchecked<'a>(
+        &'a self,
+        indexes: impl Iterator<Item = Option<usize>> + 'a,
+    ) -> impl Iterator<Item = Option<&str>> + 'a {
+        indexes.map(|opt_index| opt_index.map(|index| self.value_unchecked(index)))
+    }
 }
 
-impl<'a, Ptr, OffsetSize: StringOffsetSizeTrait> FromIterator<&'a Option<Ptr>>
+impl<'a, Ptr, OffsetSize: OffsetSizeTrait> FromIterator<&'a Option<Ptr>>
     for GenericStringArray<OffsetSize>
 where
     Ptr: AsRef<str> + 'a,
@@ -210,12 +211,12 @@ where
     }
 }
 
-impl<'a, Ptr, OffsetSize: StringOffsetSizeTrait> FromIterator<Option<Ptr>>
+impl<'a, Ptr, OffsetSize: OffsetSizeTrait> FromIterator<Option<Ptr>>
     for GenericStringArray<OffsetSize>
 where
     Ptr: AsRef<str>,
 {
-    /// Creates a [`GenericStringArray`] based on an iterator of `Option`s
+    /// Creates a [`GenericStringArray`] based on an iterator of [`Option`]s
     fn from_iter<I: IntoIterator<Item = Option<Ptr>>>(iter: I) -> Self {
         let iter = iter.into_iter();
         let (_, data_len) = iter.size_hint();
@@ -245,17 +246,17 @@ where
 
         // calculate actual data_len, which may be different from the iterator's upper bound
         let data_len = (offsets.len() / offset_size) - 1;
-        let array_data = ArrayData::builder(OffsetSize::DATA_TYPE)
+        let array_data = ArrayData::builder(Self::get_data_type())
             .len(data_len)
             .add_buffer(offsets.into())
             .add_buffer(values.into())
-            .null_bit_buffer(null_buf.into());
+            .null_bit_buffer(Some(null_buf.into()));
         let array_data = unsafe { array_data.build_unchecked() };
         Self::from(array_data)
     }
 }
 
-impl<'a, T: StringOffsetSizeTrait> IntoIterator for &'a GenericStringArray<T> {
+impl<'a, T: OffsetSizeTrait> IntoIterator for &'a GenericStringArray<T> {
     type Item = Option<&'a str>;
     type IntoIter = GenericStringIter<'a, T>;
 
@@ -264,16 +265,16 @@ impl<'a, T: StringOffsetSizeTrait> IntoIterator for &'a GenericStringArray<T> {
     }
 }
 
-impl<'a, T: StringOffsetSizeTrait> GenericStringArray<T> {
+impl<'a, T: OffsetSizeTrait> GenericStringArray<T> {
     /// constructs a new iterator
     pub fn iter(&'a self) -> GenericStringIter<'a, T> {
         GenericStringIter::<'a, T>::new(self)
     }
 }
 
-impl<OffsetSize: StringOffsetSizeTrait> fmt::Debug for GenericStringArray<OffsetSize> {
+impl<OffsetSize: OffsetSizeTrait> fmt::Debug for GenericStringArray<OffsetSize> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let prefix = if OffsetSize::is_large() { "Large" } else { "" };
+        let prefix = if OffsetSize::IS_LARGE { "Large" } else { "" };
 
         write!(f, "{}StringArray\n[\n", prefix)?;
         print_long_array(self, f, |array, index, f| {
@@ -283,7 +284,7 @@ impl<OffsetSize: StringOffsetSizeTrait> fmt::Debug for GenericStringArray<Offset
     }
 }
 
-impl<OffsetSize: StringOffsetSizeTrait> Array for GenericStringArray<OffsetSize> {
+impl<OffsetSize: OffsetSizeTrait> Array for GenericStringArray<OffsetSize> {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -293,13 +294,11 @@ impl<OffsetSize: StringOffsetSizeTrait> Array for GenericStringArray<OffsetSize>
     }
 }
 
-impl<OffsetSize: StringOffsetSizeTrait> From<ArrayData>
-    for GenericStringArray<OffsetSize>
-{
+impl<OffsetSize: OffsetSizeTrait> From<ArrayData> for GenericStringArray<OffsetSize> {
     fn from(data: ArrayData) -> Self {
         assert_eq!(
             data.data_type(),
-            &<OffsetSize as StringOffsetSizeTrait>::DATA_TYPE,
+            &Self::get_data_type(),
             "[Large]StringArray expects Datatype::[Large]Utf8"
         );
         assert_eq!(
@@ -317,27 +316,23 @@ impl<OffsetSize: StringOffsetSizeTrait> From<ArrayData>
     }
 }
 
-impl<OffsetSize: StringOffsetSizeTrait> From<Vec<Option<&str>>>
+impl<OffsetSize: OffsetSizeTrait> From<Vec<Option<&str>>>
     for GenericStringArray<OffsetSize>
 {
     fn from(v: Vec<Option<&str>>) -> Self {
-        GenericStringArray::<OffsetSize>::from_opt_vec(v)
+        v.into_iter().collect()
     }
 }
 
-impl<OffsetSize: StringOffsetSizeTrait> From<Vec<&str>>
-    for GenericStringArray<OffsetSize>
-{
+impl<OffsetSize: OffsetSizeTrait> From<Vec<&str>> for GenericStringArray<OffsetSize> {
     fn from(v: Vec<&str>) -> Self {
-        GenericStringArray::<OffsetSize>::from_vec(v)
+        Self::from_iter_values(v)
     }
 }
 
-impl<OffsetSize: StringOffsetSizeTrait> From<Vec<String>>
-    for GenericStringArray<OffsetSize>
-{
+impl<OffsetSize: OffsetSizeTrait> From<Vec<String>> for GenericStringArray<OffsetSize> {
     fn from(v: Vec<String>) -> Self {
-        GenericStringArray::<OffsetSize>::from_vec(v)
+        Self::from_iter_values(v)
     }
 }
 
@@ -365,7 +360,7 @@ pub type StringArray = GenericStringArray<i32>;
 /// ```
 pub type LargeStringArray = GenericStringArray<i64>;
 
-impl<T: StringOffsetSizeTrait> From<GenericListArray<T>> for GenericStringArray<T> {
+impl<T: OffsetSizeTrait> From<GenericListArray<T>> for GenericStringArray<T> {
     fn from(v: GenericListArray<T>) -> Self {
         GenericStringArray::<T>::from_list(v)
     }
@@ -380,9 +375,9 @@ mod tests {
 
     #[test]
     fn test_string_array_from_u8_slice() {
-        let values: Vec<&str> = vec!["hello", "", "parquet"];
+        let values: Vec<&str> = vec!["hello", "", "A£ऀ𖼚𝌆৩ƐZ"];
 
-        // Array data: ["hello", "", "parquet"]
+        // Array data: ["hello", "", "A£ऀ𖼚𝌆৩ƐZ"]
         let string_array = StringArray::from(values);
 
         assert_eq!(3, string_array.len());
@@ -391,10 +386,12 @@ mod tests {
         assert_eq!("hello", unsafe { string_array.value_unchecked(0) });
         assert_eq!("", string_array.value(1));
         assert_eq!("", unsafe { string_array.value_unchecked(1) });
-        assert_eq!("parquet", string_array.value(2));
-        assert_eq!("parquet", unsafe { string_array.value_unchecked(2) });
-        assert_eq!(5, string_array.value_offsets()[2]);
-        assert_eq!(7, string_array.value_length(2));
+        assert_eq!("A£ऀ𖼚𝌆৩ƐZ", string_array.value(2));
+        assert_eq!("A£ऀ𖼚𝌆৩ƐZ", unsafe {
+            string_array.value_unchecked(2)
+        });
+        assert_eq!(20, string_array.value_length(2)); // 1 + 2 + 3 + 4 + 4 + 3 + 2 + 1
+        assert_eq!(8, string_array.num_chars(2));
         for i in 0..3 {
             assert!(string_array.is_valid(i));
             assert!(!string_array.is_null(i));
@@ -405,14 +402,14 @@ mod tests {
     #[should_panic(expected = "[Large]StringArray expects Datatype::[Large]Utf8")]
     fn test_string_array_from_int() {
         let array = LargeStringArray::from(vec!["a", "b"]);
-        StringArray::from(array.data().clone());
+        drop(StringArray::from(array.data().clone()));
     }
 
     #[test]
     fn test_large_string_array_from_u8_slice() {
-        let values: Vec<&str> = vec!["hello", "", "parquet"];
+        let values: Vec<&str> = vec!["hello", "", "A£ऀ𖼚𝌆৩ƐZ"];
 
-        // Array data: ["hello", "", "parquet"]
+        // Array data: ["hello", "", "A£ऀ𖼚𝌆৩ƐZ"]
         let string_array = LargeStringArray::from(values);
 
         assert_eq!(3, string_array.len());
@@ -421,10 +418,13 @@ mod tests {
         assert_eq!("hello", unsafe { string_array.value_unchecked(0) });
         assert_eq!("", string_array.value(1));
         assert_eq!("", unsafe { string_array.value_unchecked(1) });
-        assert_eq!("parquet", string_array.value(2));
-        assert_eq!("parquet", unsafe { string_array.value_unchecked(2) });
+        assert_eq!("A£ऀ𖼚𝌆৩ƐZ", string_array.value(2));
+        assert_eq!("A£ऀ𖼚𝌆৩ƐZ", unsafe {
+            string_array.value_unchecked(2)
+        });
         assert_eq!(5, string_array.value_offsets()[2]);
-        assert_eq!(7, string_array.value_length(2));
+        assert_eq!(20, string_array.value_length(2)); // 1 + 2 + 3 + 4 + 4 + 3 + 2 + 1
+        assert_eq!(8, string_array.num_chars(2));
         for i in 0..3 {
             assert!(string_array.is_valid(i));
             assert!(!string_array.is_null(i));
@@ -554,13 +554,88 @@ mod tests {
     }
 
     #[test]
-    fn test_string_array_from_string_vec() {
-        let data = vec!["Foo".to_owned(), "Bar".to_owned(), "Baz".to_owned()];
+    fn test_string_array_all_null() {
+        let data = vec![None];
         let array = StringArray::from(data);
+        array
+            .data()
+            .validate_full()
+            .expect("All null array has valid array data");
+    }
 
-        assert_eq!(array.len(), 3);
-        assert_eq!(array.value(0), "Foo");
-        assert_eq!(array.value(1), "Bar");
-        assert_eq!(array.value(2), "Baz");
+    #[test]
+    fn test_large_string_array_all_null() {
+        let data = vec![None];
+        let array = LargeStringArray::from(data);
+        array
+            .data()
+            .validate_full()
+            .expect("All null array has valid array data");
+    }
+
+    #[cfg(feature = "test_utils")]
+    #[test]
+    fn bad_size_collect_string() {
+        use crate::util::test_util::BadIterator;
+        let data = vec![Some("foo"), None, Some("bar")];
+        let expected: StringArray = data.clone().into_iter().collect();
+
+        // Iterator reports too many items
+        let arr: StringArray = BadIterator::new(3, 10, data.clone()).collect();
+        assert_eq!(expected, arr);
+
+        // Iterator reports too few items
+        let arr: StringArray = BadIterator::new(3, 1, data.clone()).collect();
+        assert_eq!(expected, arr);
+    }
+
+    #[cfg(feature = "test_utils")]
+    #[test]
+    fn bad_size_collect_large_string() {
+        use crate::util::test_util::BadIterator;
+        let data = vec![Some("foo"), None, Some("bar")];
+        let expected: LargeStringArray = data.clone().into_iter().collect();
+
+        // Iterator reports too many items
+        let arr: LargeStringArray = BadIterator::new(3, 10, data.clone()).collect();
+        assert_eq!(expected, arr);
+
+        // Iterator reports too few items
+        let arr: LargeStringArray = BadIterator::new(3, 1, data.clone()).collect();
+        assert_eq!(expected, arr);
+    }
+
+    #[cfg(feature = "test_utils")]
+    #[test]
+    fn bad_size_iter_values_string() {
+        use crate::util::test_util::BadIterator;
+        let data = vec!["foo", "bar", "baz"];
+        let expected: StringArray = data.clone().into_iter().map(Some).collect();
+
+        // Iterator reports too many items
+        let arr = StringArray::from_iter_values(BadIterator::new(3, 10, data.clone()));
+        assert_eq!(expected, arr);
+
+        // Iterator reports too few items
+        let arr = StringArray::from_iter_values(BadIterator::new(3, 1, data.clone()));
+        assert_eq!(expected, arr);
+    }
+
+    #[cfg(feature = "test_utils")]
+    #[test]
+    fn bad_size_iter_values_large_string() {
+        use crate::util::test_util::BadIterator;
+        let data = vec!["foo", "bar", "baz"];
+        let expected: LargeStringArray = data.clone().into_iter().map(Some).collect();
+
+        // Iterator reports too many items
+        let arr =
+            LargeStringArray::from_iter_values(BadIterator::new(3, 10, data.clone()));
+        assert_eq!(expected, arr);
+
+        // Iterator reports too few items
+        let arr =
+            LargeStringArray::from_iter_values(BadIterator::new(3, 1, data.clone()));
+        assert_eq!(expected, arr);
     }
 }

@@ -202,6 +202,39 @@ fn array_from_json(
                         Value::String(s) => {
                             s.parse().expect("Unable to parse string as i64")
                         }
+                        Value::Object(ref map)
+                            if map.contains_key("days")
+                                && map.contains_key("milliseconds") =>
+                        {
+                            match field.data_type() {
+                                DataType::Interval(IntervalUnit::DayTime) => {
+                                    let days = map.get("days").unwrap();
+                                    let milliseconds = map.get("milliseconds").unwrap();
+
+                                    match (days, milliseconds) {
+                                        (Value::Number(d), Value::Number(m)) => {
+                                            let mut bytes = [0_u8; 8];
+                                            let m = (m.as_i64().unwrap() as i32)
+                                                .to_le_bytes();
+                                            let d = (d.as_i64().unwrap() as i32)
+                                                .to_le_bytes();
+
+                                            let c = [d, m].concat();
+                                            bytes.copy_from_slice(c.as_slice());
+                                            i64::from_le_bytes(bytes)
+                                        }
+                                        _ => panic!(
+                                            "Unable to parse {:?} as interval daytime",
+                                            value
+                                        ),
+                                    }
+                                }
+                                _ => panic!(
+                                    "Unable to parse {:?} as interval daytime",
+                                    value
+                                ),
+                            }
+                        }
                         _ => panic!("Unable to parse {:?} as number", value),
                     }),
                     _ => b.append_null(),
@@ -275,6 +308,49 @@ fn array_from_json(
                             .parse()
                             .expect("Unable to parse string as u64"),
                     ),
+                    _ => b.append_null(),
+                }?;
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::Interval(IntervalUnit::MonthDayNano) => {
+            let mut b = IntervalMonthDayNanoBuilder::new(json_col.count);
+            for (is_valid, value) in json_col
+                .validity
+                .as_ref()
+                .unwrap()
+                .iter()
+                .zip(json_col.data.unwrap())
+            {
+                match is_valid {
+                    1 => b.append_value(match value {
+                        Value::Object(v) => {
+                            let months = v.get("months").unwrap();
+                            let days = v.get("days").unwrap();
+                            let nanoseconds = v.get("nanoseconds").unwrap();
+                            match (months, days, nanoseconds) {
+                                (
+                                    Value::Number(months),
+                                    Value::Number(days),
+                                    Value::Number(nanoseconds),
+                                ) => {
+                                    let months = months.as_i64().unwrap() as i32;
+                                    let days = days.as_i64().unwrap() as i32;
+                                    let nanoseconds = nanoseconds.as_i64().unwrap();
+                                    let months_days_ns: i128 = ((nanoseconds as i128)
+                                        & 0xFFFFFFFFFFFFFFFF)
+                                        << 64
+                                        | ((days as i128) & 0xFFFFFFFF) << 32
+                                        | ((months as i128) & 0xFFFFFFFF);
+                                    months_days_ns
+                                }
+                                (_, _, _) => {
+                                    panic!("Unable to parse {:?} as MonthDayNano", v)
+                                }
+                            }
+                        }
+                        _ => panic!("Unable to parse {:?} as MonthDayNano", value),
+                    }),
                     _ => b.append_null(),
                 }?;
             }
@@ -420,7 +496,7 @@ fn array_from_json(
                 .offset(0)
                 .add_buffer(Buffer::from(&offsets.to_byte_slice()))
                 .add_child_data(child_array.data().clone())
-                .null_bit_buffer(null_buf)
+                .null_bit_buffer(Some(null_buf))
                 .build()
                 .unwrap();
             Ok(Arc::new(ListArray::from(list_data)))
@@ -448,7 +524,7 @@ fn array_from_json(
                 .offset(0)
                 .add_buffer(Buffer::from(&offsets.to_byte_slice()))
                 .add_child_data(child_array.data().clone())
-                .null_bit_buffer(null_buf)
+                .null_bit_buffer(Some(null_buf))
                 .build()
                 .unwrap();
             Ok(Arc::new(LargeListArray::from(list_data)))
@@ -464,7 +540,7 @@ fn array_from_json(
             let list_data = ArrayData::builder(field.data_type().clone())
                 .len(json_col.count)
                 .add_child_data(child_array.data().clone())
-                .null_bit_buffer(null_buf)
+                .null_bit_buffer(Some(null_buf))
                 .build()
                 .unwrap();
             Ok(Arc::new(FixedSizeListArray::from(list_data)))
@@ -474,7 +550,7 @@ fn array_from_json(
             let null_buf = create_null_buf(&json_col);
             let mut array_data = ArrayData::builder(field.data_type().clone())
                 .len(json_col.count)
-                .null_bit_buffer(null_buf);
+                .null_bit_buffer(Some(null_buf));
 
             for (field, col) in fields.iter().zip(json_col.children.unwrap()) {
                 let array = array_from_json(field, col, dictionaries)?;
@@ -502,13 +578,93 @@ fn array_from_json(
                 .get(&dict_id);
             match dictionary {
                 Some(dictionary) => dictionary_array_from_json(
-                    field, json_col, key_type, value_type, dictionary,
+                    field,
+                    json_col,
+                    key_type,
+                    value_type,
+                    dictionary,
+                    dictionaries,
                 ),
                 None => Err(ArrowError::JsonError(format!(
                     "Unable to find dictionary for field {:?}",
                     field
                 ))),
             }
+        }
+        DataType::Decimal(precision, scale) => {
+            let mut b = DecimalBuilder::new(json_col.count, *precision, *scale);
+            // C++ interop tests involve incompatible decimal values
+            unsafe {
+                b.disable_value_validation();
+            }
+            for (is_valid, value) in json_col
+                .validity
+                .as_ref()
+                .unwrap()
+                .iter()
+                .zip(json_col.data.unwrap())
+            {
+                match is_valid {
+                    1 => b.append_value(value.as_str().unwrap().parse::<i128>().unwrap()),
+                    _ => b.append_null(),
+                }?;
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::Map(child_field, _) => {
+            let null_buf = create_null_buf(&json_col);
+            let children = json_col.children.clone().unwrap();
+            let child_array = array_from_json(
+                child_field,
+                children.get(0).unwrap().clone(),
+                dictionaries,
+            )?;
+            let offsets: Vec<i32> = json_col
+                .offset
+                .unwrap()
+                .iter()
+                .map(|v| v.as_i64().unwrap() as i32)
+                .collect();
+            let array_data = ArrayData::builder(field.data_type().clone())
+                .len(json_col.count)
+                .add_buffer(Buffer::from(&offsets.to_byte_slice()))
+                .add_child_data(child_array.data().clone())
+                .null_bit_buffer(Some(null_buf))
+                .build()
+                .unwrap();
+
+            let array = MapArray::from(array_data);
+            Ok(Arc::new(array))
+        }
+        DataType::Union(fields, field_type_ids, _) => {
+            let type_ids = if let Some(type_id) = json_col.type_id {
+                type_id
+            } else {
+                return Err(ArrowError::JsonError(
+                    "Cannot find expected type_id in json column".to_string(),
+                ));
+            };
+
+            let offset: Option<Buffer> = json_col.offset.map(|offsets| {
+                let offsets: Vec<i32> =
+                    offsets.iter().map(|v| v.as_i64().unwrap() as i32).collect();
+                Buffer::from(&offsets.to_byte_slice())
+            });
+
+            let mut children: Vec<(Field, Arc<dyn Array>)> = vec![];
+            for (field, col) in fields.iter().zip(json_col.children.unwrap()) {
+                let array = array_from_json(field, col, dictionaries)?;
+                children.push((field.clone(), array));
+            }
+
+            let array = UnionArray::try_new(
+                field_type_ids,
+                Buffer::from(&type_ids.to_byte_slice()),
+                offset,
+                children,
+            )
+            .unwrap();
+            Ok(Arc::new(array))
         }
         t => Err(ArrowError::JsonError(format!(
             "data type {:?} not supported",
@@ -523,6 +679,7 @@ fn dictionary_array_from_json(
     dict_key: &DataType,
     dict_value: &DataType,
     dictionary: &ArrowJsonDictionaryBatch,
+    dictionaries: Option<&HashMap<i64, ArrowJsonDictionaryBatch>>,
 ) -> Result<ArrayRef> {
     match dict_key {
         DataType::Int8
@@ -550,15 +707,17 @@ fn dictionary_array_from_json(
             let keys = array_from_json(&key_field, json_col, None)?;
             // note: not enough info on nullability of dictionary
             let value_field = Field::new("value", dict_value.clone(), true);
-            println!("dictionary value type: {:?}", dict_value);
-            let values =
-                array_from_json(&value_field, dictionary.data.columns[0].clone(), None)?;
+            let values = array_from_json(
+                &value_field,
+                dictionary.data.columns[0].clone(),
+                dictionaries,
+            )?;
 
             // convert key and value to dictionary data
             let dict_data = ArrayData::builder(field.data_type().clone())
                 .len(keys.len())
                 .add_buffer(keys.data().buffers()[0].clone())
-                .null_bit_buffer(null_buf)
+                .null_bit_buffer(Some(null_buf))
                 .add_child_data(values.data().clone())
                 .build()
                 .unwrap();

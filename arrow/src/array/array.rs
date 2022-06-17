@@ -227,6 +227,69 @@ pub trait Array: fmt::Debug + Send + Sync + JsonEqual {
 /// A reference-counted reference to a generic `Array`.
 pub type ArrayRef = Arc<dyn Array>;
 
+/// Ergonomics: Allow use of an ArrayRef as an `&dyn Array`
+impl Array for ArrayRef {
+    fn as_any(&self) -> &dyn Any {
+        self.as_ref().as_any()
+    }
+
+    fn data(&self) -> &ArrayData {
+        self.as_ref().data()
+    }
+
+    fn data_ref(&self) -> &ArrayData {
+        self.as_ref().data_ref()
+    }
+
+    fn data_type(&self) -> &DataType {
+        self.as_ref().data_type()
+    }
+
+    fn slice(&self, offset: usize, length: usize) -> ArrayRef {
+        self.as_ref().slice(offset, length)
+    }
+
+    fn len(&self) -> usize {
+        self.as_ref().len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.as_ref().is_empty()
+    }
+
+    fn offset(&self) -> usize {
+        self.as_ref().offset()
+    }
+
+    fn is_null(&self, index: usize) -> bool {
+        self.as_ref().is_null(index)
+    }
+
+    fn is_valid(&self, index: usize) -> bool {
+        self.as_ref().is_valid(index)
+    }
+
+    fn null_count(&self) -> usize {
+        self.as_ref().null_count()
+    }
+
+    fn get_buffer_memory_size(&self) -> usize {
+        self.as_ref().get_buffer_memory_size()
+    }
+
+    fn get_array_memory_size(&self) -> usize {
+        self.as_ref().get_array_memory_size()
+    }
+
+    fn to_raw(
+        &self,
+    ) -> Result<(*const ffi::FFI_ArrowArray, *const ffi::FFI_ArrowSchema)> {
+        let data = self.data().clone();
+        let array = ffi::ArrowArray::try_from(data)?;
+        Ok(ffi::ArrowArray::into_raw(array))
+    }
+}
+
 /// Constructs an array using the input `data`.
 /// Returns a reference-counted `Array` instance.
 pub fn make_array(data: ArrayData) -> ArrayRef {
@@ -240,7 +303,7 @@ pub fn make_array(data: ArrayData) -> ArrayRef {
         DataType::UInt16 => Arc::new(UInt16Array::from(data)) as ArrayRef,
         DataType::UInt32 => Arc::new(UInt32Array::from(data)) as ArrayRef,
         DataType::UInt64 => Arc::new(UInt64Array::from(data)) as ArrayRef,
-        DataType::Float16 => panic!("Float16 datatype not supported"),
+        DataType::Float16 => Arc::new(Float16Array::from(data)) as ArrayRef,
         DataType::Float32 => Arc::new(Float32Array::from(data)) as ArrayRef,
         DataType::Float64 => Arc::new(Float64Array::from(data)) as ArrayRef,
         DataType::Date32 => Arc::new(Date32Array::from(data)) as ArrayRef,
@@ -275,6 +338,9 @@ pub fn make_array(data: ArrayData) -> ArrayRef {
         DataType::Interval(IntervalUnit::DayTime) => {
             Arc::new(IntervalDayTimeArray::from(data)) as ArrayRef
         }
+        DataType::Interval(IntervalUnit::MonthDayNano) => {
+            Arc::new(IntervalMonthDayNanoArray::from(data)) as ArrayRef
+        }
         DataType::Duration(TimeUnit::Second) => {
             Arc::new(DurationSecondArray::from(data)) as ArrayRef
         }
@@ -298,7 +364,7 @@ pub fn make_array(data: ArrayData) -> ArrayRef {
         DataType::LargeList(_) => Arc::new(LargeListArray::from(data)) as ArrayRef,
         DataType::Struct(_) => Arc::new(StructArray::from(data)) as ArrayRef,
         DataType::Map(_, _) => Arc::new(MapArray::from(data)) as ArrayRef,
-        DataType::Union(_) => Arc::new(UnionArray::from(data)) as ArrayRef,
+        DataType::Union(_, _, _) => Arc::new(UnionArray::from(data)) as ArrayRef,
         DataType::FixedSizeList(_, _) => {
             Arc::new(FixedSizeListArray::from(data)) as ArrayRef
         }
@@ -393,7 +459,7 @@ pub fn new_null_array(data_type: &DataType, length: usize) -> ArrayRef {
         DataType::UInt8 => new_null_sized_array::<UInt8Type>(data_type, length),
         DataType::Int16 => new_null_sized_array::<Int16Type>(data_type, length),
         DataType::UInt16 => new_null_sized_array::<UInt16Type>(data_type, length),
-        DataType::Float16 => unreachable!(),
+        DataType::Float16 => new_null_sized_array::<Float16Type>(data_type, length),
         DataType::Int32 => new_null_sized_array::<Int32Type>(data_type, length),
         DataType::UInt32 => new_null_sized_array::<UInt32Type>(data_type, length),
         DataType::Float32 => new_null_sized_array::<Float32Type>(data_type, length),
@@ -414,6 +480,9 @@ pub fn new_null_array(data_type: &DataType, length: usize) -> ArrayRef {
             }
             IntervalUnit::DayTime => {
                 new_null_sized_array::<IntervalDayTimeType>(data_type, length)
+            }
+            IntervalUnit::MonthDayNano => {
+                new_null_sized_array::<IntervalMonthDayNanoType>(data_type, length)
             }
         },
         DataType::FixedSizeBinary(value_len) => make_array(unsafe {
@@ -466,7 +535,7 @@ pub fn new_null_array(data_type: &DataType, length: usize) -> ArrayRef {
         DataType::Map(field, _keys_sorted) => {
             new_null_list_array::<i32>(data_type, field.data_type(), length)
         }
-        DataType::Union(_) => {
+        DataType::Union(_, _, _) => {
             unimplemented!("Creating null Union array not yet supported")
         }
         DataType::Dictionary(key, value) => {
@@ -485,9 +554,7 @@ pub fn new_null_array(data_type: &DataType, length: usize) -> ArrayRef {
                 )
             })
         }
-        DataType::Decimal(_, _) => {
-            unimplemented!("Creating null Decimal array not yet supported")
-        }
+        DataType::Decimal(_, _) => new_null_sized_decimal(data_type, length),
     }
 }
 
@@ -551,6 +618,24 @@ fn new_null_sized_array<T: ArrowPrimitiveType>(
     })
 }
 
+#[inline]
+fn new_null_sized_decimal(data_type: &DataType, length: usize) -> ArrayRef {
+    make_array(unsafe {
+        ArrayData::new_unchecked(
+            data_type.clone(),
+            length,
+            Some(length),
+            Some(MutableBuffer::new_null(length).into()),
+            0,
+            vec![Buffer::from(vec![
+                0u8;
+                length * std::mem::size_of::<i128>()
+            ])],
+            vec![],
+        )
+    })
+}
+
 /// Creates a new array from two FFI pointers. Used to import arrays from the C Data Interface
 /// # Safety
 /// Assumes that these pointers represent valid C Data Interfaces, both in memory
@@ -563,6 +648,30 @@ pub unsafe fn make_array_from_raw(
     let data = ArrayData::try_from(array)?;
     Ok(make_array(data))
 }
+
+/// Exports an array to raw pointers of the C Data Interface provided by the consumer.
+/// # Safety
+/// Assumes that these pointers represent valid C Data Interfaces, both in memory
+/// representation and lifetime via the `release` mechanism.
+///
+/// This function copies the content of two FFI structs [ffi::FFI_ArrowArray] and
+/// [ffi::FFI_ArrowSchema] in the array to the location pointed by the raw pointers.
+/// Usually the raw pointers are provided by the array data consumer.
+pub unsafe fn export_array_into_raw(
+    src: ArrayRef,
+    out_array: *mut ffi::FFI_ArrowArray,
+    out_schema: *mut ffi::FFI_ArrowSchema,
+) -> Result<()> {
+    let data = src.data();
+    let array = ffi::FFI_ArrowArray::new(data);
+    let schema = ffi::FFI_ArrowSchema::try_from(data.data_type())?;
+
+    std::ptr::write_unaligned(out_array, array);
+    std::ptr::write_unaligned(out_schema, schema);
+
+    Ok(())
+}
+
 // Helper function for printing potentially long arrays.
 pub(super) fn print_long_array<A, F>(
     array: &A,
@@ -764,11 +873,13 @@ mod tests {
 
     #[test]
     fn test_memory_size_primitive_nullable() {
-        let arr: PrimitiveArray<Int64Type> = (0..128).map(Some).collect();
+        let arr: PrimitiveArray<Int64Type> = (0..128)
+            .map(|i| if i % 20 == 0 { Some(i) } else { None })
+            .collect();
         let empty_with_bitmap = PrimitiveArray::<Int64Type>::from(
             ArrayData::builder(arr.data_type().clone())
                 .add_buffer(MutableBuffer::new(0).into())
-                .null_bit_buffer(MutableBuffer::new_null(0).into())
+                .null_bit_buffer(Some(MutableBuffer::new_null(0).into()))
                 .build()
                 .unwrap(),
         );
@@ -836,5 +947,23 @@ mod tests {
             arr.get_array_memory_size() - empty.get_array_memory_size(),
             expected_size
         );
+    }
+
+    /// Test function that takes an &dyn Array
+    fn compute_my_thing(arr: &dyn Array) -> bool {
+        !arr.is_empty()
+    }
+
+    #[test]
+    fn test_array_ref_as_array() {
+        let arr: Int32Array = vec![1, 2, 3].into_iter().map(Some).collect();
+
+        // works well!
+        assert!(compute_my_thing(&arr));
+
+        // Should also work when wrapped as an ArrayRef
+        let arr: ArrayRef = Arc::new(arr);
+        assert!(compute_my_thing(&arr));
+        assert!(compute_my_thing(arr.as_ref()));
     }
 }

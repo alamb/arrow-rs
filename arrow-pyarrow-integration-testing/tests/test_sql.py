@@ -55,15 +55,21 @@ _supported_pyarrow_types = [
     pa.timestamp("us"),
     pa.timestamp("us", tz="UTC"),
     pa.timestamp("us", tz="Europe/Paris"),
+    pa.duration("s"),
+    pa.duration("ms"),
+    pa.duration("us"),
+    pa.duration("ns"),
     pa.float16(),
     pa.float32(),
     pa.float64(),
     pa.decimal128(19, 4),
     pa.string(),
     pa.binary(),
+    pa.binary(10),
     pa.large_string(),
     pa.large_binary(),
     pa.list_(pa.int32()),
+    pa.list_(pa.int32(), 2),
     pa.large_list(pa.uint16()),
     pa.struct(
         [
@@ -79,13 +85,11 @@ _supported_pyarrow_types = [
             pa.field("c", pa.string()),
         ]
     ),
+    pa.dictionary(pa.int8(), pa.string()),
 ]
 
 _unsupported_pyarrow_types = [
     pa.decimal256(76, 38),
-    pa.duration("s"),
-    pa.binary(10),
-    pa.list_(pa.int32(), 2),
     pa.map_(pa.string(), pa.int32()),
     pa.union(
         [pa.field("a", pa.binary(10)), pa.field("b", pa.string())],
@@ -121,14 +125,6 @@ def test_type_roundtrip(pyarrow_type):
 def test_type_roundtrip_raises(pyarrow_type):
     with pytest.raises(pa.ArrowException):
         rust.round_trip_type(pyarrow_type)
-
-
-def test_dictionary_type_roundtrip():
-    # the dictionary type conversion is incomplete
-    pyarrow_type = pa.dictionary(pa.int32(), pa.string())
-    ty = rust.round_trip_type(pyarrow_type)
-    assert ty == pa.int32()
-
 
 @pytest.mark.parametrize('pyarrow_type', _supported_pyarrow_types, ids=str)
 def test_field_roundtrip(pyarrow_type):
@@ -197,6 +193,29 @@ def test_time32_python():
     del b
     del expected
 
+def test_binary_array():
+    """
+    Python -> Rust -> Python
+    """
+    a = pa.array(["a", None, "bb", "ccc"], pa.binary())
+    b = rust.round_trip_array(a)
+    b.validate(full=True)
+    assert a.to_pylist() == b.to_pylist()
+    assert a.type == b.type
+    del a
+    del b
+
+def test_fixed_len_binary_array():
+    """
+    Python -> Rust -> Python
+    """
+    a = pa.array(["aaa", None, "bbb", "ccc"], pa.binary(3))
+    b = rust.round_trip_array(a)
+    b.validate(full=True)
+    assert a.to_pylist() == b.to_pylist()
+    assert a.type == b.type
+    del a
+    del b
 
 def test_list_array():
     """
@@ -210,6 +229,17 @@ def test_list_array():
     del a
     del b
 
+def test_fixed_len_list_array():
+    """
+    Python -> Rust -> Python
+    """
+    a = pa.array([[1, 2], None, [3, 4], [5, 6]], pa.list_(pa.int64(), 2))
+    b = rust.round_trip_array(a)
+    b.validate(full=True)
+    assert a.to_pylist() == b.to_pylist()
+    assert a.type == b.type
+    del a
+    del b
 
 def test_timestamp_python():
     """
@@ -263,3 +293,29 @@ def test_decimal_python():
     assert a == b
     del a
     del b
+
+def test_dictionary_python():
+    """
+    Python -> Rust -> Python
+    """
+    a = pa.array(["a", None, "b", None, "a"], type=pa.dictionary(pa.int8(), pa.string()))
+    b = rust.round_trip_array(a)
+    assert a == b
+    del a
+    del b
+
+def test_record_batch_reader():
+    """
+    Python -> Rust -> Python
+    """
+    schema = pa.schema([('ints', pa.list_(pa.int32()))], metadata={b'key1': b'value1'})
+    batches = [
+        pa.record_batch([[[1], [2, 42]]], schema),
+        pa.record_batch([[None, [], [5, 6]]], schema),
+    ]
+    a = pa.RecordBatchReader.from_batches(schema, batches)
+    b = rust.round_trip_record_batch_reader(a)
+
+    assert b.schema == schema
+    got_batches = list(b)
+    assert got_batches == batches

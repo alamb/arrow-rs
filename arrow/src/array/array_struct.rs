@@ -108,10 +108,12 @@ impl StructArray {
 
 impl From<ArrayData> for StructArray {
     fn from(data: ArrayData) -> Self {
-        let mut boxed_fields = vec![];
-        for cd in data.child_data() {
-            boxed_fields.push(make_array(cd.clone()));
-        }
+        let boxed_fields = data
+            .child_data()
+            .iter()
+            .map(|cd| make_array(cd.clone()))
+            .collect();
+
         Self { data, boxed_fields }
     }
 }
@@ -174,12 +176,10 @@ impl TryFrom<Vec<(&str, ArrayRef)>> for StructArray {
         }
         let len = len.unwrap();
 
-        let mut builder = ArrayData::builder(DataType::Struct(fields))
+        let builder = ArrayData::builder(DataType::Struct(fields))
             .len(len)
+            .null_bit_buffer(null)
             .child_data(child_data);
-        if let Some(null_buffer) = null {
-            builder = builder.null_bit_buffer(null_buffer);
-        }
 
         let array_data = unsafe { builder.build_unchecked() };
 
@@ -268,7 +268,7 @@ impl From<(Vec<(Field, ArrayRef)>, Buffer)> for StructArray {
         }
 
         let array_data = ArrayData::builder(DataType::Struct(field_types))
-            .null_bit_buffer(pair.1)
+            .null_bit_buffer(Some(pair.1))
             .child_data(field_values.into_iter().map(|a| a.data().clone()).collect())
             .len(length);
         let array_data = unsafe { array_data.build_unchecked() };
@@ -358,13 +358,13 @@ mod tests {
         assert_eq!(1, struct_data.null_count());
         assert_eq!(
             // 00001011
-            &Some(Bitmap::from(Buffer::from(&[11_u8]))),
+            Some(&Bitmap::from(Buffer::from(&[11_u8]))),
             struct_data.null_bitmap()
         );
 
         let expected_string_data = ArrayData::builder(DataType::Utf8)
             .len(4)
-            .null_bit_buffer(Buffer::from(&[9_u8]))
+            .null_bit_buffer(Some(Buffer::from(&[9_u8])))
             .add_buffer(Buffer::from(&[0, 3, 3, 3, 7].to_byte_slice()))
             .add_buffer(Buffer::from(b"joemark"))
             .build()
@@ -372,7 +372,7 @@ mod tests {
 
         let expected_int_data = ArrayData::builder(DataType::Int32)
             .len(4)
-            .null_bit_buffer(Buffer::from(&[11_u8]))
+            .null_bit_buffer(Some(Buffer::from(&[11_u8])))
             .add_buffer(Buffer::from(&[1, 2, 0, 4].to_byte_slice()))
             .build()
             .unwrap();
@@ -408,7 +408,7 @@ mod tests {
         expected = "the field data types must match the array data in a StructArray"
     )]
     fn test_struct_array_from_mismatched_types() {
-        StructArray::from(vec![
+        drop(StructArray::from(vec![
             (
                 Field::new("b", DataType::Int16, false),
                 Arc::new(BooleanArray::from(vec![false, false, true, true]))
@@ -418,7 +418,7 @@ mod tests {
                 Field::new("c", DataType::Utf8, false),
                 Arc::new(Int32Array::from(vec![42, 28, 19, 31])),
             ),
-        ]);
+        ]));
     }
 
     #[test]
@@ -426,24 +426,25 @@ mod tests {
         let boolean_data = ArrayData::builder(DataType::Boolean)
             .len(5)
             .add_buffer(Buffer::from([0b00010000]))
-            .null_bit_buffer(Buffer::from([0b00010001]))
+            .null_bit_buffer(Some(Buffer::from([0b00010001])))
             .build()
             .unwrap();
         let int_data = ArrayData::builder(DataType::Int32)
             .len(5)
             .add_buffer(Buffer::from([0, 28, 42, 0, 0].to_byte_slice()))
-            .null_bit_buffer(Buffer::from([0b00000110]))
+            .null_bit_buffer(Some(Buffer::from([0b00000110])))
             .build()
             .unwrap();
 
-        let mut field_types = vec![];
-        field_types.push(Field::new("a", DataType::Boolean, false));
-        field_types.push(Field::new("b", DataType::Int32, false));
+        let field_types = vec![
+            Field::new("a", DataType::Boolean, false),
+            Field::new("b", DataType::Int32, false),
+        ];
         let struct_array_data = ArrayData::builder(DataType::Struct(field_types))
             .len(5)
             .add_child_data(boolean_data.clone())
             .add_child_data(int_data.clone())
-            .null_bit_buffer(Buffer::from([0b00010111]))
+            .null_bit_buffer(Some(Buffer::from([0b00010111])))
             .build()
             .unwrap();
         let struct_array = StructArray::from(struct_array_data);
@@ -515,7 +516,7 @@ mod tests {
         expected = "all child arrays of a StructArray must have the same length"
     )]
     fn test_invalid_struct_child_array_lengths() {
-        StructArray::from(vec![
+        drop(StructArray::from(vec![
             (
                 Field::new("b", DataType::Float32, false),
                 Arc::new(Float32Array::from(vec![1.1])) as Arc<dyn Array>,
@@ -524,6 +525,6 @@ mod tests {
                 Field::new("c", DataType::Float64, false),
                 Arc::new(Float64Array::from(vec![2.2, 3.3])),
             ),
-        ]);
+        ]));
     }
 }

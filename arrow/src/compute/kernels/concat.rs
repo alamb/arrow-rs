@@ -34,9 +34,7 @@ use crate::array::*;
 use crate::datatypes::DataType;
 use crate::error::{ArrowError, Result};
 
-fn compute_str_values_length<Offset: StringOffsetSizeTrait>(
-    arrays: &[&ArrayData],
-) -> usize {
+fn compute_str_values_length<Offset: OffsetSizeTrait>(arrays: &[&ArrayData]) -> usize {
     arrays
         .iter()
         .map(|&data| {
@@ -524,5 +522,51 @@ mod tests {
         assert_eq!(arr.data().buffers()[1].capacity(), 960);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_dictionary_concat_reuse() {
+        let array: DictionaryArray<Int8Type> =
+            vec!["a", "a", "b", "c"].into_iter().collect();
+        let copy: DictionaryArray<Int8Type> = array.data().clone().into();
+
+        // dictionary is "a", "b", "c"
+        assert_eq!(
+            array.values(),
+            &(Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef)
+        );
+        assert_eq!(array.keys(), &Int8Array::from(vec![0, 0, 1, 2]));
+
+        // concatenate it with itself
+        let combined = concat(&[&copy as _, &array as _]).unwrap();
+
+        let combined = combined
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int8Type>>()
+            .unwrap();
+
+        assert_eq!(
+            combined.values(),
+            &(Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef),
+            "Actual: {:#?}",
+            combined
+        );
+
+        assert_eq!(
+            combined.keys(),
+            &Int8Array::from(vec![0, 0, 1, 2, 0, 0, 1, 2])
+        );
+
+        // Should have reused the dictionary
+        assert!(array.data().child_data()[0].ptr_eq(&combined.data().child_data()[0]));
+        assert!(copy.data().child_data()[0].ptr_eq(&combined.data().child_data()[0]));
+
+        let new: DictionaryArray<Int8Type> = vec!["d"].into_iter().collect();
+        let combined = concat(&[&copy as _, &array as _, &new as _]).unwrap();
+
+        // Should not have reused the dictionary
+        assert!(!array.data().child_data()[0].ptr_eq(&combined.data().child_data()[0]));
+        assert!(!copy.data().child_data()[0].ptr_eq(&combined.data().child_data()[0]));
+        assert!(!new.data().child_data()[0].ptr_eq(&combined.data().child_data()[0]));
     }
 }

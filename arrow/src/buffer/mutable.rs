@@ -1,14 +1,3 @@
-use std::ptr::NonNull;
-
-use crate::{
-    alloc,
-    bytes::{Bytes, Deallocation},
-    datatypes::{ArrowNativeType, ToByteSlice},
-    util::bit_util,
-};
-
-use super::Buffer;
-
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -26,12 +15,26 @@ use super::Buffer;
 // specific language governing permissions and limitations
 // under the License.
 
+use super::Buffer;
+use crate::alloc::Deallocation;
+use crate::{
+    alloc,
+    bytes::Bytes,
+    datatypes::{ArrowNativeType, ToByteSlice},
+    util::bit_util,
+};
+use std::ptr::NonNull;
+
 /// A [`MutableBuffer`] is Arrow's interface to build a [`Buffer`] out of items or slices of items.
 /// [`Buffer`]s created from [`MutableBuffer`] (via `into`) are guaranteed to have its pointer aligned
 /// along cache lines and in multiple of 64 bytes.
 /// Use [MutableBuffer::push] to insert an item, [MutableBuffer::extend_from_slice]
 /// to insert many items, and `into` to convert it to [`Buffer`].
+///
+/// For a safe, strongly typed API consider using [`crate::array::BufferBuilder`]
+///
 /// # Example
+///
 /// ```
 /// # use arrow::buffer::{Buffer, MutableBuffer};
 /// let mut buffer = MutableBuffer::new(0);
@@ -153,6 +156,17 @@ impl MutableBuffer {
         }
     }
 
+    /// Truncates this buffer to `len` bytes
+    ///
+    /// If `len` is greater than the buffer's current length, this has no effect
+    #[inline(always)]
+    pub fn truncate(&mut self, len: usize) {
+        if len > self.len {
+            return;
+        }
+        self.len = len;
+    }
+
     /// Resizes the buffer, either truncating its contents (with no change in capacity), or
     /// growing it (potentially reallocating it) and writing `value` in the newly available bytes.
     /// # Example
@@ -268,22 +282,26 @@ impl MutableBuffer {
     #[inline]
     pub(super) fn into_buffer(self) -> Buffer {
         let bytes = unsafe {
-            Bytes::new(self.data, self.len, Deallocation::Native(self.capacity))
+            Bytes::new(self.data, self.len, Deallocation::Arrow(self.capacity))
         };
         std::mem::forget(self);
         Buffer::from_bytes(bytes)
     }
 
-    /// View this buffer asa slice of a specific type.
-    /// # Safety
-    /// This function must only be used when this buffer was extended with items of type `T`.
-    /// Failure to do so results in undefined behavior.
+    /// View this buffer as a slice of a specific type.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if the underlying buffer is not aligned
+    /// correctly for type `T`.
     pub fn typed_data_mut<T: ArrowNativeType>(&mut self) -> &mut [T] {
-        unsafe {
-            let (prefix, offsets, suffix) = self.as_slice_mut().align_to_mut::<T>();
-            assert!(prefix.is_empty() && suffix.is_empty());
-            offsets
-        }
+        // SAFETY
+        // ArrowNativeType is trivially transmutable, is sealed to prevent potentially incorrect
+        // implementation outside this crate, and this method checks alignment
+        let (prefix, offsets, suffix) =
+            unsafe { self.as_slice_mut().align_to_mut::<T>() };
+        assert!(prefix.is_empty() && suffix.is_empty());
+        offsets
     }
 
     /// Extends this buffer from a slice of items that can be represented in bytes, increasing its capacity if needed.
@@ -295,13 +313,16 @@ impl MutableBuffer {
     /// assert_eq!(buffer.len(), 8) // u32 has 4 bytes
     /// ```
     #[inline]
-    pub fn extend_from_slice<T: ToByteSlice>(&mut self, items: &[T]) {
+    pub fn extend_from_slice<T: ArrowNativeType>(&mut self, items: &[T]) {
         let len = items.len();
         let additional = len * std::mem::size_of::<T>();
         self.reserve(additional);
         unsafe {
-            let dst = self.data.as_ptr().add(self.len);
+            // this assumes that `[ToByteSlice]` can be copied directly
+            // without calling `to_byte_slice` for each element,
+            // which is correct for all ArrowNativeType implementations.
             let src = items.as_ptr() as *const u8;
+            let dst = self.data.as_ptr().add(self.len);
             std::ptr::copy_nonoverlapping(src, dst, additional)
         }
         self.len += additional;
@@ -320,8 +341,9 @@ impl MutableBuffer {
         let additional = std::mem::size_of::<T>();
         self.reserve(additional);
         unsafe {
-            let dst = self.data.as_ptr().add(self.len) as *mut T;
-            std::ptr::write(dst, item);
+            let src = item.to_byte_slice().as_ptr();
+            let dst = self.data.as_ptr().add(self.len);
+            std::ptr::copy_nonoverlapping(src, dst, additional);
         }
         self.len += additional;
     }
@@ -332,8 +354,9 @@ impl MutableBuffer {
     #[inline]
     pub unsafe fn push_unchecked<T: ToByteSlice>(&mut self, item: T) {
         let additional = std::mem::size_of::<T>();
-        let dst = self.data.as_ptr().add(self.len) as *mut T;
-        std::ptr::write(dst, item);
+        let src = item.to_byte_slice().as_ptr();
+        let dst = self.data.as_ptr().add(self.len);
+        std::ptr::copy_nonoverlapping(src, dst, additional);
         self.len += additional;
     }
 
@@ -380,23 +403,24 @@ impl MutableBuffer {
         &mut self,
         mut iterator: I,
     ) {
-        let size = std::mem::size_of::<T>();
+        let item_size = std::mem::size_of::<T>();
         let (lower, _) = iterator.size_hint();
-        let additional = lower * size;
+        let additional = lower * item_size;
         self.reserve(additional);
 
         // this is necessary because of https://github.com/rust-lang/rust/issues/32155
         let mut len = SetLenOnDrop::new(&mut self.len);
-        let mut dst = unsafe { self.data.as_ptr().add(len.local_len) as *mut T };
+        let mut dst = unsafe { self.data.as_ptr().add(len.local_len) };
         let capacity = self.capacity;
 
-        while len.local_len + size <= capacity {
+        while len.local_len + item_size <= capacity {
             if let Some(item) = iterator.next() {
                 unsafe {
-                    std::ptr::write(dst, item);
-                    dst = dst.add(1);
+                    let src = item.to_byte_slice().as_ptr();
+                    std::ptr::copy_nonoverlapping(src, dst, item_size);
+                    dst = dst.add(item_size);
                 }
-                len.local_len += size;
+                len.local_len += item_size;
             } else {
                 break;
             }
@@ -427,21 +451,23 @@ impl MutableBuffer {
     pub unsafe fn from_trusted_len_iter<T: ArrowNativeType, I: Iterator<Item = T>>(
         iterator: I,
     ) -> Self {
+        let item_size = std::mem::size_of::<T>();
         let (_, upper) = iterator.size_hint();
         let upper = upper.expect("from_trusted_len_iter requires an upper limit");
-        let len = upper * std::mem::size_of::<T>();
+        let len = upper * item_size;
 
         let mut buffer = MutableBuffer::new(len);
 
-        let mut dst = buffer.data.as_ptr() as *mut T;
+        let mut dst = buffer.data.as_ptr();
         for item in iterator {
             // note how there is no reserve here (compared with `extend_from_iter`)
-            std::ptr::write(dst, item);
-            dst = dst.add(1);
+            let src = item.to_byte_slice().as_ptr();
+            std::ptr::copy_nonoverlapping(src, dst, item_size);
+            dst = dst.add(item_size);
         }
         assert_eq!(
-            dst.offset_from(buffer.data.as_ptr() as *mut T) as usize,
-            upper,
+            dst.offset_from(buffer.data.as_ptr()) as usize,
+            len,
             "Trusted iterator length was not accurately reported"
         );
         buffer.len = len;
@@ -518,34 +544,32 @@ impl MutableBuffer {
     >(
         iterator: I,
     ) -> std::result::Result<Self, E> {
+        let item_size = std::mem::size_of::<T>();
         let (_, upper) = iterator.size_hint();
         let upper = upper.expect("try_from_trusted_len_iter requires an upper limit");
-        let len = upper * std::mem::size_of::<T>();
+        let len = upper * item_size;
 
         let mut buffer = MutableBuffer::new(len);
 
-        let mut dst = buffer.data.as_ptr() as *mut T;
+        let mut dst = buffer.data.as_ptr();
         for item in iterator {
+            let item = item?;
             // note how there is no reserve here (compared with `extend_from_iter`)
-            std::ptr::write(dst, item?);
-            dst = dst.add(1);
+            let src = item.to_byte_slice().as_ptr();
+            std::ptr::copy_nonoverlapping(src, dst, item_size);
+            dst = dst.add(item_size);
         }
         // try_from_trusted_len_iter is instantiated a lot, so we extract part of it into a less
         // generic method to reduce compile time
-        unsafe fn finalize_buffer<T>(
-            dst: *mut T,
-            buffer: &mut MutableBuffer,
-            upper: usize,
-            len: usize,
-        ) {
+        unsafe fn finalize_buffer(dst: *mut u8, buffer: &mut MutableBuffer, len: usize) {
             assert_eq!(
-                dst.offset_from(buffer.data.as_ptr() as *mut T) as usize,
-                upper,
+                dst.offset_from(buffer.data.as_ptr()) as usize,
+                len,
                 "Trusted iterator length was not accurately reported"
             );
             buffer.len = len;
         }
-        finalize_buffer(dst, &mut buffer, upper, len);
+        finalize_buffer(dst, &mut buffer, len);
         Ok(buffer)
     }
 }
@@ -705,6 +729,44 @@ mod tests {
             &[1u8, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0],
             buf.as_slice()
         );
+    }
+
+    #[test]
+    fn mutable_extend_from_iter_unaligned_u64() {
+        let mut buf = MutableBuffer::new(16);
+        buf.push(1_u8);
+        buf.extend([1_u64]);
+        assert_eq!(9, buf.len());
+        assert_eq!(&[1u8, 1u8, 0, 0, 0, 0, 0, 0, 0], buf.as_slice());
+    }
+
+    #[test]
+    fn mutable_extend_from_slice_unaligned_u64() {
+        let mut buf = MutableBuffer::new(16);
+        buf.extend_from_slice(&[1_u8]);
+        buf.extend_from_slice(&[1_u64]);
+        assert_eq!(9, buf.len());
+        assert_eq!(&[1u8, 1u8, 0, 0, 0, 0, 0, 0, 0], buf.as_slice());
+    }
+
+    #[test]
+    fn mutable_push_unaligned_u64() {
+        let mut buf = MutableBuffer::new(16);
+        buf.push(1_u8);
+        buf.push(1_u64);
+        assert_eq!(9, buf.len());
+        assert_eq!(&[1u8, 1u8, 0, 0, 0, 0, 0, 0, 0], buf.as_slice());
+    }
+
+    #[test]
+    fn mutable_push_unchecked_unaligned_u64() {
+        let mut buf = MutableBuffer::new(16);
+        unsafe {
+            buf.push_unchecked(1_u8);
+            buf.push_unchecked(1_u64);
+        }
+        assert_eq!(9, buf.len());
+        assert_eq!(&[1u8, 1u8, 0, 0, 0, 0, 0, 0, 0], buf.as_slice());
     }
 
     #[test]

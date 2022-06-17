@@ -30,13 +30,13 @@ use crate::column::reader::{ColumnReader, ColumnReaderImpl};
 use crate::column::writer::{ColumnWriter, ColumnWriterImpl};
 use crate::errors::{ParquetError, Result};
 use crate::util::{
-    bit_util::{from_ne_slice, FromBytes},
-    memory::{ByteBuffer, ByteBufferPtr},
+    bit_util::{from_le_slice, from_ne_slice, FromBytes},
+    memory::ByteBufferPtr,
 };
 
 /// Rust representation for logical type INT96, value is backed by an array of `u32`.
 /// The type only takes 12 bytes, without extra padding.
-#[derive(Clone, Debug, PartialOrd)]
+#[derive(Clone, Debug, PartialOrd, Default)]
 pub struct Int96 {
     value: Option<[u32; 3]>,
 }
@@ -75,12 +75,6 @@ impl Int96 {
     }
 }
 
-impl Default for Int96 {
-    fn default() -> Self {
-        Self { value: None }
-    }
-}
-
 impl PartialEq for Int96 {
     fn eq(&self, other: &Int96) -> bool {
         match (&self.value, &other.value) {
@@ -109,7 +103,7 @@ impl fmt::Display for Int96 {
 
 /// Rust representation for BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY Parquet physical types.
 /// Value is backed by a byte buffer.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ByteArray {
     data: Option<ByteBufferPtr>,
 }
@@ -220,20 +214,6 @@ impl<'a> From<&'a str> for ByteArray {
 impl From<ByteBufferPtr> for ByteArray {
     fn from(ptr: ByteBufferPtr) -> ByteArray {
         Self { data: Some(ptr) }
-    }
-}
-
-impl From<ByteBuffer> for ByteArray {
-    fn from(mut buf: ByteBuffer) -> ByteArray {
-        Self {
-            data: Some(buf.consume()),
-        }
-    }
-}
-
-impl Default for ByteArray {
-    fn default() -> Self {
-        ByteArray { data: None }
     }
 }
 
@@ -610,6 +590,8 @@ pub(crate) mod private {
         + super::FromBytes
         + super::SliceAsBytes
         + PartialOrd
+        + Send
+        + crate::encodings::decoding::private::GetDecoder
     {
         /// Encode the value directly from a higher level encoder
         fn encode<W: std::io::Write>(
@@ -858,17 +840,12 @@ pub(crate) mod private {
             decoder.start += bytes_to_decode;
 
             let mut pos = 0; // position in byte array
-            for i in 0..num_values {
+            for item in buffer.iter_mut().take(num_values) {
                 let elem0 = byteorder::LittleEndian::read_u32(&bytes[pos..pos + 4]);
                 let elem1 = byteorder::LittleEndian::read_u32(&bytes[pos + 4..pos + 8]);
                 let elem2 = byteorder::LittleEndian::read_u32(&bytes[pos + 8..pos + 12]);
 
-                buffer[i]
-                    .as_mut_any()
-                    .downcast_mut::<Self>()
-                    .unwrap()
-                    .set_data(elem0, elem1, elem2);
-
+                item.set_data(elem0, elem1, elem2);
                 pos += 12;
             }
             decoder.num_values -= num_values;
@@ -1012,16 +989,15 @@ pub(crate) mod private {
                 .as_mut()
                 .expect("set_data should have been called");
             let num_values = std::cmp::min(buffer.len(), decoder.num_values);
-            for i in 0..num_values {
+
+            for item in buffer.iter_mut().take(num_values) {
                 let len = decoder.type_length as usize;
 
                 if data.len() < decoder.start + len {
                     return Err(eof_err!("Not enough bytes to decode"));
                 }
 
-                let val: &mut Self = buffer[i].as_mut_any().downcast_mut().unwrap();
-
-                val.set_data(data.range(decoder.start, len));
+                item.set_data(data.range(decoder.start, len));
                 decoder.start += len;
             }
             decoder.num_values -= num_values;
@@ -1048,7 +1024,7 @@ pub(crate) mod private {
 
 /// Contains the Parquet physical type information as well as the Rust primitive type
 /// presentation.
-pub trait DataType: 'static {
+pub trait DataType: 'static + Send {
     type T: private::ParquetValueType;
 
     /// Returns Parquet physical type.
@@ -1061,19 +1037,21 @@ pub trait DataType: 'static {
     where
         Self: Sized;
 
-    fn get_column_writer(column_writer: ColumnWriter) -> Option<ColumnWriterImpl<Self>>
+    fn get_column_writer(
+        column_writer: ColumnWriter<'_>,
+    ) -> Option<ColumnWriterImpl<'_, Self>>
     where
         Self: Sized;
 
-    fn get_column_writer_ref(
-        column_writer: &ColumnWriter,
-    ) -> Option<&ColumnWriterImpl<Self>>
+    fn get_column_writer_ref<'a, 'b: 'a>(
+        column_writer: &'b ColumnWriter<'a>,
+    ) -> Option<&'b ColumnWriterImpl<'a, Self>>
     where
         Self: Sized;
 
-    fn get_column_writer_mut(
-        column_writer: &mut ColumnWriter,
-    ) -> Option<&mut ColumnWriterImpl<Self>>
+    fn get_column_writer_mut<'a, 'b: 'a>(
+        column_writer: &'a mut ColumnWriter<'b>,
+    ) -> Option<&'a mut ColumnWriterImpl<'b, Self>>
     where
         Self: Sized;
 }
@@ -1118,26 +1096,26 @@ macro_rules! make_type {
             }
 
             fn get_column_writer(
-                column_writer: ColumnWriter,
-            ) -> Option<ColumnWriterImpl<Self>> {
+                column_writer: ColumnWriter<'_>,
+            ) -> Option<ColumnWriterImpl<'_, Self>> {
                 match column_writer {
                     ColumnWriter::$writer_ident(w) => Some(w),
                     _ => None,
                 }
             }
 
-            fn get_column_writer_ref(
-                column_writer: &ColumnWriter,
-            ) -> Option<&ColumnWriterImpl<Self>> {
+            fn get_column_writer_ref<'a, 'b: 'a>(
+                column_writer: &'a ColumnWriter<'b>,
+            ) -> Option<&'a ColumnWriterImpl<'b, Self>> {
                 match column_writer {
                     ColumnWriter::$writer_ident(w) => Some(w),
                     _ => None,
                 }
             }
 
-            fn get_column_writer_mut(
-                column_writer: &mut ColumnWriter,
-            ) -> Option<&mut ColumnWriterImpl<Self>> {
+            fn get_column_writer_mut<'a, 'b: 'a>(
+                column_writer: &'a mut ColumnWriter<'b>,
+            ) -> Option<&'a mut ColumnWriterImpl<'b, Self>> {
                 match column_writer {
                     ColumnWriter::$writer_ident(w) => Some(w),
                     _ => None,
@@ -1216,8 +1194,14 @@ make_type!(
 
 impl FromBytes for Int96 {
     type Buffer = [u8; 12];
-    fn from_le_bytes(_bs: Self::Buffer) -> Self {
-        unimplemented!()
+    fn from_le_bytes(bs: Self::Buffer) -> Self {
+        let mut i = Int96::new();
+        i.set_data(
+            from_le_slice(&bs[0..4]),
+            from_le_slice(&bs[4..8]),
+            from_le_slice(&bs[8..12]),
+        );
+        i
     }
     fn from_be_bytes(_bs: Self::Buffer) -> Self {
         unimplemented!()
@@ -1237,8 +1221,8 @@ impl FromBytes for Int96 {
 // appear to actual be converted directly from bytes
 impl FromBytes for ByteArray {
     type Buffer = [u8; 8];
-    fn from_le_bytes(_bs: Self::Buffer) -> Self {
-        unreachable!()
+    fn from_le_bytes(bs: Self::Buffer) -> Self {
+        ByteArray::from(bs.to_vec())
     }
     fn from_be_bytes(_bs: Self::Buffer) -> Self {
         unreachable!()
@@ -1251,8 +1235,8 @@ impl FromBytes for ByteArray {
 impl FromBytes for FixedLenByteArray {
     type Buffer = [u8; 8];
 
-    fn from_le_bytes(_bs: Self::Buffer) -> Self {
-        unreachable!()
+    fn from_le_bytes(bs: Self::Buffer) -> Self {
+        Self(ByteArray::from(bs.to_vec()))
     }
     fn from_be_bytes(_bs: Self::Buffer) -> Self {
         unreachable!()
@@ -1338,8 +1322,7 @@ mod tests {
             ByteArray::from(ByteBufferPtr::new(vec![1u8, 2u8, 3u8, 4u8, 5u8])).data(),
             &[1u8, 2u8, 3u8, 4u8, 5u8]
         );
-        let mut buf = ByteBuffer::new();
-        buf.set_data(vec![6u8, 7u8, 8u8, 9u8, 10u8]);
+        let buf = vec![6u8, 7u8, 8u8, 9u8, 10u8];
         assert_eq!(ByteArray::from(buf).data(), &[6u8, 7u8, 8u8, 9u8, 10u8]);
     }
 

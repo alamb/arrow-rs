@@ -16,7 +16,6 @@
 // under the License.
 
 use std::any::Any;
-use std::borrow::Borrow;
 use std::convert::From;
 use std::fmt;
 use std::iter::{FromIterator, IntoIterator};
@@ -34,14 +33,7 @@ use crate::{
     util::trusted_len_unzip,
 };
 
-/// Number of seconds in a day
-const SECONDS_IN_DAY: i64 = 86_400;
-/// Number of milliseconds in a second
-const MILLISECONDS: i64 = 1_000;
-/// Number of microseconds in a second
-const MICROSECONDS: i64 = 1_000_000;
-/// Number of nanoseconds in a second
-const NANOSECONDS: i64 = 1_000_000_000;
+use half::f16;
 
 /// Array whose elements are of primitive types.
 ///
@@ -140,7 +132,7 @@ impl<T: ArrowPrimitiveType> PrimitiveArray<T> {
 
     /// Creates a PrimitiveArray based on a constant value with `count` elements
     pub fn from_value(value: T::Native, count: usize) -> Self {
-        // # Safety: length is known
+        // # Safety: iterator (0..count) correctly reports its length
         let val_buf = unsafe { Buffer::from_trusted_len_iter((0..count).map(|_| value)) };
         let data = unsafe {
             ArrayData::new_unchecked(
@@ -154,6 +146,25 @@ impl<T: ArrowPrimitiveType> PrimitiveArray<T> {
             )
         };
         PrimitiveArray::from(data)
+    }
+
+    /// Returns an iterator that returns the values of `array.value(i)` for an iterator with each element `i`
+    pub fn take_iter<'a>(
+        &'a self,
+        indexes: impl Iterator<Item = Option<usize>> + 'a,
+    ) -> impl Iterator<Item = Option<T::Native>> + 'a {
+        indexes.map(|opt_index| opt_index.map(|index| self.value(index)))
+    }
+
+    /// Returns an iterator that returns the values of `array.value(i)` for an iterator with each element `i`
+    /// # Safety
+    ///
+    /// caller must ensure that the offsets in the iterator are less than the array len()
+    pub unsafe fn take_iter_unchecked<'a>(
+        &'a self,
+        indexes: impl Iterator<Item = Option<usize>> + 'a,
+    ) -> impl Iterator<Item = Option<T::Native>> + 'a {
+        indexes.map(|opt_index| opt_index.map(|index| self.value_unchecked(index)))
     }
 }
 
@@ -330,36 +341,91 @@ impl<'a, T: ArrowPrimitiveType> PrimitiveArray<T> {
     }
 }
 
-impl<T: ArrowPrimitiveType, Ptr: Borrow<Option<<T as ArrowPrimitiveType>::Native>>>
-    FromIterator<Ptr> for PrimitiveArray<T>
+/// This struct is used as an adapter when creating `PrimitiveArray` from an iterator.
+/// `FromIterator` for `PrimitiveArray` takes an iterator where the elements can be `into`
+/// this struct. So once implementing `From` or `Into` trait for a type, an iterator of
+/// the type can be collected to `PrimitiveArray`.
+#[derive(Debug)]
+pub struct NativeAdapter<T: ArrowPrimitiveType> {
+    pub native: Option<T::Native>,
+}
+
+macro_rules! def_from_for_primitive {
+    ( $ty:ident, $tt:tt) => {
+        impl From<$tt> for NativeAdapter<$ty> {
+            fn from(value: $tt) -> Self {
+                NativeAdapter {
+                    native: Some(value),
+                }
+            }
+        }
+    };
+}
+
+def_from_for_primitive!(Int8Type, i8);
+def_from_for_primitive!(Int16Type, i16);
+def_from_for_primitive!(Int32Type, i32);
+def_from_for_primitive!(Int64Type, i64);
+def_from_for_primitive!(UInt8Type, u8);
+def_from_for_primitive!(UInt16Type, u16);
+def_from_for_primitive!(UInt32Type, u32);
+def_from_for_primitive!(UInt64Type, u64);
+def_from_for_primitive!(Float16Type, f16);
+def_from_for_primitive!(Float32Type, f32);
+def_from_for_primitive!(Float64Type, f64);
+
+impl<T: ArrowPrimitiveType> From<Option<<T as ArrowPrimitiveType>::Native>>
+    for NativeAdapter<T>
+{
+    fn from(value: Option<<T as ArrowPrimitiveType>::Native>) -> Self {
+        NativeAdapter { native: value }
+    }
+}
+
+impl<T: ArrowPrimitiveType> From<&Option<<T as ArrowPrimitiveType>::Native>>
+    for NativeAdapter<T>
+{
+    fn from(value: &Option<<T as ArrowPrimitiveType>::Native>) -> Self {
+        NativeAdapter { native: *value }
+    }
+}
+
+impl<'a, T: ArrowPrimitiveType, Ptr: Into<NativeAdapter<T>>> FromIterator<Ptr>
+    for PrimitiveArray<T>
 {
     fn from_iter<I: IntoIterator<Item = Ptr>>(iter: I) -> Self {
         let iter = iter.into_iter();
         let (lower, _) = iter.size_hint();
 
-        let mut null_buf = BooleanBufferBuilder::new(lower);
+        let mut null_builder = BooleanBufferBuilder::new(lower);
 
         let buffer: Buffer = iter
             .map(|item| {
-                if let Some(a) = item.borrow() {
-                    null_buf.append(true);
-                    *a
+                if let Some(a) = item.into().native {
+                    null_builder.append(true);
+                    a
                 } else {
-                    null_buf.append(false);
+                    null_builder.append(false);
                     // this ensures that null items on the buffer are not arbitrary.
-                    // This is important because falible operations can use null values (e.g. a vectorized "add")
+                    // This is important because fallible operations can use null values (e.g. a vectorized "add")
                     // which may panic (e.g. overflow if the number on the slots happen to be very large).
                     T::Native::default()
                 }
             })
             .collect();
 
+        let len = null_builder.len();
+        let null_buf: Buffer = null_builder.into();
+        let valid_count = null_buf.count_set_bits();
+        let null_count = len - valid_count;
+        let opt_null_buf = (null_count != 0).then(|| null_buf);
+
         let data = unsafe {
             ArrayData::new_unchecked(
                 T::DATA_TYPE,
-                null_buf.len(),
-                None,
-                Some(null_buf.into()),
+                len,
+                Some(null_count),
+                opt_null_buf,
                 0,
                 vec![buffer],
                 vec![],
@@ -444,6 +510,7 @@ def_numeric_from_vec!(Time64MicrosecondType);
 def_numeric_from_vec!(Time64NanosecondType);
 def_numeric_from_vec!(IntervalYearMonthType);
 def_numeric_from_vec!(IntervalDayTimeType);
+def_numeric_from_vec!(IntervalMonthDayNanoType);
 def_numeric_from_vec!(DurationSecondType);
 def_numeric_from_vec!(DurationMillisecondType);
 def_numeric_from_vec!(DurationMicrosecondType);
@@ -489,7 +556,7 @@ impl<T: ArrowTimestampType> PrimitiveArray<T> {
             ArrayData::builder(DataType::Timestamp(T::get_time_unit(), timezone))
                 .len(data_len)
                 .add_buffer(val_buf.into())
-                .null_bit_buffer(null_buf.into());
+                .null_bit_buffer(Some(null_buf.into()));
         let array_data = unsafe { array_data.build_unchecked() };
         PrimitiveArray::from(array_data)
     }
@@ -519,6 +586,7 @@ mod tests {
     use std::thread;
 
     use crate::buffer::Buffer;
+    use crate::compute::eq_dyn;
     use crate::datatypes::DataType;
 
     #[test]
@@ -649,6 +717,23 @@ mod tests {
         assert!(arr.is_null(1));
         assert_eq!(-5, arr.value(2));
         assert_eq!(-5, arr.values()[2]);
+
+        // a month_day_nano interval contains months, days and nanoseconds,
+        // but we do not yet have accessors for the values.
+        // TODO: implement month, day, and nanos access method for month_day_nano.
+        let arr = IntervalMonthDayNanoArray::from(vec![
+            Some(100000000000000000000),
+            None,
+            Some(-500000000000000000000),
+        ]);
+        assert_eq!(3, arr.len());
+        assert_eq!(0, arr.offset());
+        assert_eq!(1, arr.null_count());
+        assert_eq!(100000000000000000000, arr.value(0));
+        assert_eq!(100000000000000000000, arr.values()[0]);
+        assert!(arr.is_null(1));
+        assert_eq!(-500000000000000000000, arr.value(2));
+        assert_eq!(-500000000000000000000, arr.values()[2]);
     }
 
     #[test]
@@ -894,7 +979,7 @@ mod tests {
     #[test]
     fn test_primitive_array_builder() {
         // Test building a primitive array with ArrayData builder and offset
-        let buf = Buffer::from_slice_ref(&[0, 1, 2, 3, 4]);
+        let buf = Buffer::from_slice_ref(&[0i32, 1, 2, 3, 4, 5, 6]);
         let buf2 = buf.clone();
         let data = ArrayData::builder(DataType::Int32)
             .len(5)
@@ -947,11 +1032,32 @@ mod tests {
     }
 
     #[test]
+    fn test_primitive_array_from_non_null_iter() {
+        let iter = (0..10_i32).map(Some);
+        let primitive_array = PrimitiveArray::<Int32Type>::from_iter(iter);
+        assert_eq!(primitive_array.len(), 10);
+        assert_eq!(primitive_array.null_count(), 0);
+        assert_eq!(primitive_array.data().null_buffer(), None);
+        assert_eq!(primitive_array.values(), &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+    }
+
+    #[test]
     #[should_panic(expected = "PrimitiveArray data should contain a single buffer only \
                                (values buffer)")]
+    // Different error messages, so skip for now
+    // https://github.com/apache/arrow-rs/issues/1545
+    #[cfg(not(feature = "force_validate"))]
     fn test_primitive_array_invalid_buffer_len() {
-        let data = ArrayData::builder(DataType::Int32).len(5).build().unwrap();
-        Int32Array::from(data);
+        let buffer = Buffer::from_slice_ref(&[0i32, 1, 2, 3, 4]);
+        let data = unsafe {
+            ArrayData::builder(DataType::Int32)
+                .add_buffer(buffer.clone())
+                .add_buffer(buffer)
+                .len(5)
+                .build_unchecked()
+        };
+
+        drop(Int32Array::from(data));
     }
 
     #[test]
@@ -961,5 +1067,17 @@ mod tests {
 
         assert!(ret.is_ok());
         assert_eq!(8, ret.ok().unwrap());
+    }
+
+    #[test]
+    fn test_primitive_array_creation() {
+        let array1: Int8Array = [10_i8, 11, 12, 13, 14].into_iter().collect();
+        let array2: Int8Array = [10_i8, 11, 12, 13, 14].into_iter().map(Some).collect();
+
+        let result = eq_dyn(&array1, &array2);
+        assert_eq!(
+            result.unwrap(),
+            BooleanArray::from(vec![true, true, true, true, true])
+        );
     }
 }

@@ -58,10 +58,13 @@ and bug fixes and this plays a critical role in the release process.
 
 For design discussions we generally collaborate on Google documents and file a GitHub issue linking to the document.
 
+There is more information in the [contributing] guide.
+
 [rust]: https://www.rust-lang.org/
 [arrow-readme]: arrow/README.md
+[contributing]: CONTRIBUTING.md
 [parquet-readme]: parquet/README.md
 [flight-readme]: arrow-flight/README.md
 [datafusion-readme]: https://github.com/apache/arrow-datafusion/blob/master/README.md
-[ballista-readme]: https://github.com/apache/arrow-datafusion/blob/master/ballista/README.md
+[ballista-readme]: https://github.com/apache/arrow-ballista/blob/master/README.md
 [issues]: https://github.com/apache/arrow-rs/issues

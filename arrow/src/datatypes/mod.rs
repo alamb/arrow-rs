@@ -46,7 +46,7 @@ pub type SchemaRef = Arc<Schema>;
 mod tests {
     use super::*;
     use crate::error::Result;
-    use serde_json::Value::{Bool, Number as VNumber};
+    use serde_json::Value::{Bool, Number as VNumber, String as VString};
     use serde_json::{Number, Value};
     use std::{
         collections::{BTreeMap, HashMap},
@@ -123,12 +123,12 @@ mod tests {
         let field_metadata: BTreeMap<String, String> = kv_array.iter().cloned().collect();
 
         // Non-empty map: should be converted as JSON obj { ... }
-        let mut first_name = Field::new("first_name", DataType::Utf8, false);
-        first_name.set_metadata(Some(field_metadata));
+        let first_name = Field::new("first_name", DataType::Utf8, false)
+            .with_metadata(Some(field_metadata));
 
         // Empty map: should be omitted.
-        let mut last_name = Field::new("last_name", DataType::Utf8, false);
-        last_name.set_metadata(Some(BTreeMap::default()));
+        let last_name = Field::new("last_name", DataType::Utf8, false)
+            .with_metadata(Some(BTreeMap::default()));
 
         let person = DataType::Struct(vec![
             first_name,
@@ -393,6 +393,61 @@ mod tests {
     }
 
     #[test]
+    fn parse_union_from_json() {
+        let json = r#"
+        {
+            "name": "my_union",
+            "nullable": false,
+            "type": {
+                "name": "union",
+                "mode": "SPARSE",
+                "typeIds": [
+                    5,
+                    7
+                ]
+            },
+            "children": [
+                {
+                    "name": "f1",
+                    "type": {
+                        "name": "int",
+                        "isSigned": true,
+                        "bitWidth": 32
+                    },
+                    "nullable": true,
+                    "children": []
+                },
+                {
+                    "name": "f2",
+                    "type": {
+                        "name": "utf8"
+                    },
+                    "nullable": true,
+                    "children": []
+                }
+            ]
+        }
+        "#;
+        let value: Value = serde_json::from_str(json).unwrap();
+        let dt = Field::from(&value).unwrap();
+
+        let expected = Field::new(
+            "my_union",
+            DataType::Union(
+                vec![
+                    Field::new("f1", DataType::Int32, true),
+                    Field::new("f2", DataType::Utf8, true),
+                ],
+                vec![5, 7],
+                UnionMode::Sparse,
+            ),
+            false,
+        );
+
+        assert_eq!(expected, dt);
+    }
+
+    #[test]
     fn parse_utf8_from_json() {
         let json = "{\"name\":\"utf8\"}";
         let value: Value = serde_json::from_str(json).unwrap();
@@ -454,13 +509,14 @@ mod tests {
                 ),
                 Field::new("c19", DataType::Interval(IntervalUnit::DayTime), false),
                 Field::new("c20", DataType::Interval(IntervalUnit::YearMonth), false),
+                Field::new("c21", DataType::Interval(IntervalUnit::MonthDayNano), false),
                 Field::new(
-                    "c21",
+                    "c22",
                     DataType::List(Box::new(Field::new("item", DataType::Boolean, true))),
                     false,
                 ),
                 Field::new(
-                    "c22",
+                    "c23",
                     DataType::FixedSizeList(
                         Box::new(Field::new("bools", DataType::Boolean, false)),
                         5,
@@ -468,7 +524,7 @@ mod tests {
                     false,
                 ),
                 Field::new(
-                    "c23",
+                    "c24",
                     DataType::List(Box::new(Field::new(
                         "inner_list",
                         DataType::List(Box::new(Field::new(
@@ -481,21 +537,22 @@ mod tests {
                     true,
                 ),
                 Field::new(
-                    "c24",
+                    "c25",
                     DataType::Struct(vec![
                         Field::new("a", DataType::Utf8, false),
                         Field::new("b", DataType::UInt16, false),
                     ]),
                     false,
                 ),
-                Field::new("c25", DataType::Interval(IntervalUnit::YearMonth), true),
-                Field::new("c26", DataType::Interval(IntervalUnit::DayTime), true),
-                Field::new("c27", DataType::Duration(TimeUnit::Second), false),
-                Field::new("c28", DataType::Duration(TimeUnit::Millisecond), false),
-                Field::new("c29", DataType::Duration(TimeUnit::Microsecond), false),
-                Field::new("c30", DataType::Duration(TimeUnit::Nanosecond), false),
+                Field::new("c26", DataType::Interval(IntervalUnit::YearMonth), true),
+                Field::new("c27", DataType::Interval(IntervalUnit::DayTime), true),
+                Field::new("c28", DataType::Interval(IntervalUnit::MonthDayNano), true),
+                Field::new("c29", DataType::Duration(TimeUnit::Second), false),
+                Field::new("c30", DataType::Duration(TimeUnit::Millisecond), false),
+                Field::new("c31", DataType::Duration(TimeUnit::Microsecond), false),
+                Field::new("c32", DataType::Duration(TimeUnit::Nanosecond), false),
                 Field::new_dict(
-                    "c31",
+                    "c33",
                     DataType::Dictionary(
                         Box::new(DataType::Int32),
                         Box::new(DataType::Utf8),
@@ -504,10 +561,10 @@ mod tests {
                     123,
                     true,
                 ),
-                Field::new("c32", DataType::LargeBinary, true),
-                Field::new("c33", DataType::LargeUtf8, true),
+                Field::new("c34", DataType::LargeBinary, true),
+                Field::new("c35", DataType::LargeUtf8, true),
                 Field::new(
-                    "c34",
+                    "c36",
                     DataType::LargeList(Box::new(Field::new(
                         "inner_large_list",
                         DataType::LargeList(Box::new(Field::new(
@@ -520,7 +577,7 @@ mod tests {
                     true,
                 ),
                 Field::new(
-                    "c35",
+                    "c37",
                     DataType::Map(
                         Box::new(Field::new(
                             "my_entries",
@@ -732,6 +789,15 @@ mod tests {
                         "name": "c21",
                         "nullable": false,
                         "type": {
+                            "name": "interval",
+                            "unit": "MONTH_DAY_NANO"
+                        },
+                        "children": []
+                    },
+                    {
+                        "name": "c22",
+                        "nullable": false,
+                        "type": {
                             "name": "list"
                         },
                         "children": [
@@ -746,7 +812,7 @@ mod tests {
                         ]
                     },
                     {
-                        "name": "c22",
+                        "name": "c23",
                         "nullable": false,
                         "type": {
                             "name": "fixedsizelist",
@@ -764,7 +830,7 @@ mod tests {
                         ]
                     },
                     {
-                        "name": "c23",
+                        "name": "c24",
                         "nullable": true,
                         "type": {
                             "name": "list"
@@ -790,7 +856,7 @@ mod tests {
                         ]
                     },
                     {
-                        "name": "c24",
+                        "name": "c25",
                         "nullable": false,
                         "type": {
                             "name": "struct"
@@ -817,7 +883,7 @@ mod tests {
                         ]
                     },
                     {
-                        "name": "c25",
+                        "name": "c26",
                         "nullable": true,
                         "type": {
                             "name": "interval",
@@ -826,7 +892,7 @@ mod tests {
                         "children": []
                     },
                     {
-                        "name": "c26",
+                        "name": "c27",
                         "nullable": true,
                         "type": {
                             "name": "interval",
@@ -835,20 +901,11 @@ mod tests {
                         "children": []
                     },
                     {
-                        "name": "c27",
-                        "nullable": false,
-                        "type": {
-                            "name": "duration",
-                            "unit": "SECOND"
-                        },
-                        "children": []
-                    },
-                    {
                         "name": "c28",
-                        "nullable": false,
+                        "nullable": true,
                         "type": {
-                            "name": "duration",
-                            "unit": "MILLISECOND"
+                            "name": "interval",
+                            "unit": "MONTH_DAY_NANO"
                         },
                         "children": []
                     },
@@ -857,7 +914,7 @@ mod tests {
                         "nullable": false,
                         "type": {
                             "name": "duration",
-                            "unit": "MICROSECOND"
+                            "unit": "SECOND"
                         },
                         "children": []
                     },
@@ -866,12 +923,30 @@ mod tests {
                         "nullable": false,
                         "type": {
                             "name": "duration",
-                            "unit": "NANOSECOND"
+                            "unit": "MILLISECOND"
                         },
                         "children": []
                     },
                     {
                         "name": "c31",
+                        "nullable": false,
+                        "type": {
+                            "name": "duration",
+                            "unit": "MICROSECOND"
+                        },
+                        "children": []
+                    },
+                    {
+                        "name": "c32",
+                        "nullable": false,
+                        "type": {
+                            "name": "duration",
+                            "unit": "NANOSECOND"
+                        },
+                        "children": []
+                    },
+                    {
+                        "name": "c33",
                         "nullable": true,
                         "children": [],
                         "type": {
@@ -888,7 +963,7 @@ mod tests {
                         }
                     },
                     {
-                        "name": "c32",
+                        "name": "c34",
                         "nullable": true,
                         "type": {
                           "name": "largebinary"
@@ -896,7 +971,7 @@ mod tests {
                         "children": []
                     },
                     {
-                        "name": "c33",
+                        "name": "c35",
                         "nullable": true,
                         "type": {
                           "name": "largeutf8"
@@ -904,7 +979,7 @@ mod tests {
                         "children": []
                     },
                     {
-                        "name": "c34",
+                        "name": "c36",
                         "nullable": true,
                         "type": {
                           "name": "largelist"
@@ -930,7 +1005,7 @@ mod tests {
                         ]
                     },
                     {
-                        "name": "c35",
+                        "name": "c37",
                         "nullable": false,
                         "type": {
                             "name": "map",
@@ -1134,8 +1209,7 @@ mod tests {
         assert!(schema2 != schema4);
         assert!(schema3 != schema4);
 
-        let mut f = Field::new("c1", DataType::Utf8, false);
-        f.set_metadata(Some(
+        let f = Field::new("c1", DataType::Utf8, false).with_metadata(Some(
             [("foo".to_string(), "bar".to_string())]
                 .iter()
                 .cloned()
@@ -1156,6 +1230,7 @@ mod tests {
         assert_eq!(Some(VNumber(Number::from(1))), 1i16.into_json_value());
         assert_eq!(Some(VNumber(Number::from(1))), 1i32.into_json_value());
         assert_eq!(Some(VNumber(Number::from(1))), 1i64.into_json_value());
+        assert_eq!(Some(VString("1".to_string())), 1i128.into_json_value());
         assert_eq!(Some(VNumber(Number::from(1))), 1u8.into_json_value());
         assert_eq!(Some(VNumber(Number::from(1))), 1u16.into_json_value());
         assert_eq!(Some(VNumber(Number::from(1))), 1u32.into_json_value());
@@ -1174,8 +1249,8 @@ mod tests {
     fn person_schema() -> Schema {
         let kv_array = [("k".to_string(), "v".to_string())];
         let field_metadata: BTreeMap<String, String> = kv_array.iter().cloned().collect();
-        let mut first_name = Field::new("first_name", DataType::Utf8, false);
-        first_name.set_metadata(Some(field_metadata));
+        let first_name = Field::new("first_name", DataType::Utf8, false)
+            .with_metadata(Some(field_metadata));
 
         Schema::new(vec![
             first_name,
@@ -1206,16 +1281,16 @@ mod tests {
                 .iter()
                 .cloned()
                 .collect();
-        let mut f1 = Field::new("first_name", DataType::Utf8, false);
-        f1.set_metadata(Some(metadata1));
+        let f1 = Field::new("first_name", DataType::Utf8, false)
+            .with_metadata(Some(metadata1));
 
         let metadata2: BTreeMap<String, String> =
             [("foo".to_string(), "baz".to_string())]
                 .iter()
                 .cloned()
                 .collect();
-        let mut f2 = Field::new("first_name", DataType::Utf8, false);
-        f2.set_metadata(Some(metadata2));
+        let f2 = Field::new("first_name", DataType::Utf8, false)
+            .with_metadata(Some(metadata2));
 
         assert!(
             Schema::try_merge(vec![Schema::new(vec![f1]), Schema::new(vec![f2])])
@@ -1229,8 +1304,8 @@ mod tests {
                 .iter()
                 .cloned()
                 .collect();
-        let mut f2 = Field::new("first_name", DataType::Utf8, false);
-        f2.set_metadata(Some(metadata2));
+        let f2 = Field::new("first_name", DataType::Utf8, false)
+            .with_metadata(Some(metadata2));
 
         assert!(f1.try_merge(&f2).is_ok());
         assert!(f1.metadata().is_some());
@@ -1240,15 +1315,13 @@ mod tests {
         );
 
         // 3. Some + Some
-        let mut f1 = Field::new("first_name", DataType::Utf8, false);
-        f1.set_metadata(Some(
+        let mut f1 = Field::new("first_name", DataType::Utf8, false).with_metadata(Some(
             [("foo".to_string(), "bar".to_string())]
                 .iter()
                 .cloned()
                 .collect(),
         ));
-        let mut f2 = Field::new("first_name", DataType::Utf8, false);
-        f2.set_metadata(Some(
+        let f2 = Field::new("first_name", DataType::Utf8, false).with_metadata(Some(
             [("foo2".to_string(), "bar2".to_string())]
                 .iter()
                 .cloned()
@@ -1258,7 +1331,7 @@ mod tests {
         assert!(f1.try_merge(&f2).is_ok());
         assert!(f1.metadata().is_some());
         assert_eq!(
-            f1.metadata().clone().unwrap(),
+            f1.metadata().cloned().unwrap(),
             [
                 ("foo".to_string(), "bar".to_string()),
                 ("foo2".to_string(), "bar2".to_string())
@@ -1269,8 +1342,7 @@ mod tests {
         );
 
         // 4. Some + None.
-        let mut f1 = Field::new("first_name", DataType::Utf8, false);
-        f1.set_metadata(Some(
+        let mut f1 = Field::new("first_name", DataType::Utf8, false).with_metadata(Some(
             [("foo".to_string(), "bar".to_string())]
                 .iter()
                 .cloned()
@@ -1280,7 +1352,7 @@ mod tests {
         assert!(f1.try_merge(&f2).is_ok());
         assert!(f1.metadata().is_some());
         assert_eq!(
-            f1.metadata().clone().unwrap(),
+            f1.metadata().cloned().unwrap(),
             [("foo".to_string(), "bar".to_string())]
                 .iter()
                 .cloned()
@@ -1358,28 +1430,40 @@ mod tests {
             Schema::try_merge(vec![
                 Schema::new(vec![Field::new(
                     "c1",
-                    DataType::Union(vec![
-                        Field::new("c11", DataType::Utf8, true),
-                        Field::new("c12", DataType::Utf8, true),
-                    ]),
+                    DataType::Union(
+                        vec![
+                            Field::new("c11", DataType::Utf8, true),
+                            Field::new("c12", DataType::Utf8, true),
+                        ],
+                        vec![0, 1],
+                        UnionMode::Dense
+                    ),
                     false
                 ),]),
                 Schema::new(vec![Field::new(
                     "c1",
-                    DataType::Union(vec![
-                        Field::new("c12", DataType::Utf8, true),
-                        Field::new("c13", DataType::Time64(TimeUnit::Second), true),
-                    ]),
+                    DataType::Union(
+                        vec![
+                            Field::new("c12", DataType::Utf8, true),
+                            Field::new("c13", DataType::Time64(TimeUnit::Second), true),
+                        ],
+                        vec![1, 2],
+                        UnionMode::Dense
+                    ),
                     false
                 ),])
             ])?,
             Schema::new(vec![Field::new(
                 "c1",
-                DataType::Union(vec![
-                    Field::new("c11", DataType::Utf8, true),
-                    Field::new("c12", DataType::Utf8, true),
-                    Field::new("c13", DataType::Time64(TimeUnit::Second), true),
-                ]),
+                DataType::Union(
+                    vec![
+                        Field::new("c11", DataType::Utf8, true),
+                        Field::new("c12", DataType::Utf8, true),
+                        Field::new("c13", DataType::Time64(TimeUnit::Second), true),
+                    ],
+                    vec![0, 1, 2],
+                    UnionMode::Dense
+                ),
                 false
             ),]),
         );

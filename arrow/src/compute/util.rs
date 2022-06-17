@@ -18,78 +18,45 @@
 //! Common utilities for computation kernels.
 
 use crate::array::*;
-use crate::buffer::{buffer_bin_and, buffer_bin_or, Buffer};
+use crate::buffer::{buffer_bin_and, Buffer};
 use crate::datatypes::*;
 use crate::error::{ArrowError, Result};
 use num::{One, ToPrimitive, Zero};
 use std::ops::Add;
 
-/// Combines the null bitmaps of two arrays using a bitwise `and` operation.
+/// Combines the null bitmaps of multiple arrays using a bitwise `and` operation.
 ///
 /// This function is useful when implementing operations on higher level arrays.
 #[allow(clippy::unnecessary_wraps)]
 pub(super) fn combine_option_bitmap(
-    left_data: &ArrayData,
-    right_data: &ArrayData,
+    arrays: &[&ArrayData],
     len_in_bits: usize,
 ) -> Result<Option<Buffer>> {
-    let left_offset_in_bits = left_data.offset();
-    let right_offset_in_bits = right_data.offset();
-
-    let left = left_data.null_buffer();
-    let right = right_data.null_buffer();
-
-    match left {
-        None => match right {
-            None => Ok(None),
-            Some(r) => Ok(Some(r.bit_slice(right_offset_in_bits, len_in_bits))),
-        },
-        Some(l) => match right {
-            None => Ok(Some(l.bit_slice(left_offset_in_bits, len_in_bits))),
-
-            Some(r) => Ok(Some(buffer_bin_and(
-                l,
-                left_offset_in_bits,
-                r,
-                right_offset_in_bits,
-                len_in_bits,
-            ))),
-        },
-    }
-}
-
-/// Compares the null bitmaps of two arrays using a bitwise `or` operation.
-///
-/// This function is useful when implementing operations on higher level arrays.
-#[allow(clippy::unnecessary_wraps)]
-pub(super) fn compare_option_bitmap(
-    left_data: &ArrayData,
-    right_data: &ArrayData,
-    len_in_bits: usize,
-) -> Result<Option<Buffer>> {
-    let left_offset_in_bits = left_data.offset();
-    let right_offset_in_bits = right_data.offset();
-
-    let left = left_data.null_buffer();
-    let right = right_data.null_buffer();
-
-    match left {
-        None => match right {
-            None => Ok(None),
-            Some(r) => Ok(Some(r.bit_slice(right_offset_in_bits, len_in_bits))),
-        },
-        Some(l) => match right {
-            None => Ok(Some(l.bit_slice(left_offset_in_bits, len_in_bits))),
-
-            Some(r) => Ok(Some(buffer_bin_or(
-                l,
-                left_offset_in_bits,
-                r,
-                right_offset_in_bits,
-                len_in_bits,
-            ))),
-        },
-    }
+    arrays
+        .iter()
+        .map(|array| (array.null_buffer().cloned(), array.offset()))
+        .reduce(|acc, buffer_and_offset| match (acc, buffer_and_offset) {
+            ((None, _), (None, _)) => (None, 0),
+            ((Some(buffer), offset), (None, _)) | ((None, _), (Some(buffer), offset)) => {
+                (Some(buffer), offset)
+            }
+            ((Some(buffer_left), offset_left), (Some(buffer_right), offset_right)) => (
+                Some(buffer_bin_and(
+                    &buffer_left,
+                    offset_left,
+                    &buffer_right,
+                    offset_right,
+                    len_in_bits,
+                )),
+                0,
+            ),
+        })
+        .map_or(
+            Err(ArrowError::ComputeError(
+                "Arrays must not be empty".to_string(),
+            )),
+            |(buffer, offset)| Ok(buffer.map(|buffer| buffer.slice(offset))),
+        )
 }
 
 /// Takes/filters a list array's inner data using the offsets of the list array.
@@ -175,24 +142,58 @@ pub(super) mod tests {
 
     use std::sync::Arc;
 
+    use crate::buffer::buffer_bin_or;
     use crate::datatypes::DataType;
     use crate::util::bit_util;
     use crate::{array::ArrayData, buffer::MutableBuffer};
+
+    /// Compares the null bitmaps of two arrays using a bitwise `or` operation.
+    ///
+    /// This function is useful when implementing operations on higher level arrays.
+    pub(super) fn compare_option_bitmap(
+        left_data: &ArrayData,
+        right_data: &ArrayData,
+        len_in_bits: usize,
+    ) -> Result<Option<Buffer>> {
+        let left_offset_in_bits = left_data.offset();
+        let right_offset_in_bits = right_data.offset();
+
+        let left = left_data.null_buffer();
+        let right = right_data.null_buffer();
+
+        match left {
+            None => match right {
+                None => Ok(None),
+                Some(r) => Ok(Some(r.bit_slice(right_offset_in_bits, len_in_bits))),
+            },
+            Some(l) => match right {
+                None => Ok(Some(l.bit_slice(left_offset_in_bits, len_in_bits))),
+
+                Some(r) => Ok(Some(buffer_bin_or(
+                    l,
+                    left_offset_in_bits,
+                    r,
+                    right_offset_in_bits,
+                    len_in_bits,
+                ))),
+            },
+        }
+    }
 
     fn make_data_with_null_bit_buffer(
         len: usize,
         offset: usize,
         null_bit_buffer: Option<Buffer>,
     ) -> Arc<ArrayData> {
-        // empty vec for buffers and children is not really correct, but for these tests we only care about the null bitmap
+        let buffer = Buffer::from(&vec![11; len]);
+
         Arc::new(
             ArrayData::try_new(
                 DataType::UInt8,
                 len,
-                None,
                 null_bit_buffer,
                 offset,
-                vec![],
+                vec![buffer],
                 vec![],
             )
             .unwrap(),
@@ -206,25 +207,52 @@ pub(super) mod tests {
             make_data_with_null_bit_buffer(8, 0, Some(Buffer::from([0b01001010])));
         let inverse_bitmap =
             make_data_with_null_bit_buffer(8, 0, Some(Buffer::from([0b10110101])));
+        let some_other_bitmap =
+            make_data_with_null_bit_buffer(8, 0, Some(Buffer::from([0b11010111])));
+        assert_eq!(
+            combine_option_bitmap(&[], 8).unwrap_err().to_string(),
+            "Compute error: Arrays must not be empty",
+        );
+        assert_eq!(
+            Some(Buffer::from([0b01001010])),
+            combine_option_bitmap(&[&some_bitmap], 8).unwrap()
+        );
         assert_eq!(
             None,
-            combine_option_bitmap(&none_bitmap, &none_bitmap, 8).unwrap()
+            combine_option_bitmap(&[&none_bitmap, &none_bitmap], 8).unwrap()
         );
         assert_eq!(
             Some(Buffer::from([0b01001010])),
-            combine_option_bitmap(&some_bitmap, &none_bitmap, 8).unwrap()
+            combine_option_bitmap(&[&some_bitmap, &none_bitmap], 8).unwrap()
+        );
+        assert_eq!(
+            Some(Buffer::from([0b11010111])),
+            combine_option_bitmap(&[&none_bitmap, &some_other_bitmap], 8).unwrap()
         );
         assert_eq!(
             Some(Buffer::from([0b01001010])),
-            combine_option_bitmap(&none_bitmap, &some_bitmap, 8,).unwrap()
-        );
-        assert_eq!(
-            Some(Buffer::from([0b01001010])),
-            combine_option_bitmap(&some_bitmap, &some_bitmap, 8,).unwrap()
+            combine_option_bitmap(&[&some_bitmap, &some_bitmap], 8,).unwrap()
         );
         assert_eq!(
             Some(Buffer::from([0b0])),
-            combine_option_bitmap(&some_bitmap, &inverse_bitmap, 8,).unwrap()
+            combine_option_bitmap(&[&some_bitmap, &inverse_bitmap], 8,).unwrap()
+        );
+        assert_eq!(
+            Some(Buffer::from([0b01000010])),
+            combine_option_bitmap(&[&some_bitmap, &some_other_bitmap, &none_bitmap], 8,)
+                .unwrap()
+        );
+        assert_eq!(
+            Some(Buffer::from([0b00001001])),
+            combine_option_bitmap(
+                &[
+                    &some_bitmap.slice(3, 5),
+                    &inverse_bitmap.slice(2, 5),
+                    &some_other_bitmap.slice(1, 5)
+                ],
+                5,
+            )
+            .unwrap()
         );
     }
 
@@ -300,7 +328,7 @@ pub(super) mod tests {
                 values.append(&mut array);
             } else {
                 list_null_count += 1;
-                bit_util::unset_bit(&mut list_bitmap.as_slice_mut(), idx);
+                bit_util::unset_bit(list_bitmap.as_slice_mut(), idx);
             }
             offset.push(values.len() as i64);
         }
@@ -333,34 +361,13 @@ pub(super) mod tests {
 
         let list_data = ArrayData::builder(list_data_type)
             .len(list_len)
-            .null_bit_buffer(list_bitmap.into())
+            .null_bit_buffer(Some(list_bitmap.into()))
             .add_buffer(value_offsets)
             .add_child_data(value_data)
             .build()
             .unwrap();
 
         GenericListArray::<S>::from(list_data)
-    }
-
-    pub(crate) fn build_fixed_size_list<T>(
-        data: Vec<Option<Vec<T::Native>>>,
-        length: <Int32Type as ArrowPrimitiveType>::Native,
-    ) -> FixedSizeListArray
-    where
-        T: ArrowPrimitiveType,
-        PrimitiveArray<T>: From<Vec<Option<T::Native>>>,
-    {
-        let data = data
-            .into_iter()
-            .map(|subarray| {
-                subarray.map(|item| {
-                    item.into_iter()
-                        .map(Some)
-                        .collect::<Vec<Option<T::Native>>>()
-                })
-            })
-            .collect();
-        build_fixed_size_list_nullable(data, length)
     }
 
     pub(crate) fn build_fixed_size_list_nullable<T>(
@@ -385,7 +392,7 @@ pub(super) mod tests {
                 values.extend(items.into_iter());
             } else {
                 list_null_count += 1;
-                bit_util::unset_bit(&mut list_bitmap.as_slice_mut(), idx);
+                bit_util::unset_bit(list_bitmap.as_slice_mut(), idx);
                 values.extend(vec![None; length as usize].into_iter());
             }
         }
@@ -399,7 +406,7 @@ pub(super) mod tests {
 
         let list_data = ArrayData::builder(list_data_type)
             .len(list_len)
-            .null_bit_buffer(list_bitmap.into())
+            .null_bit_buffer(Some(list_bitmap.into()))
             .add_child_data(child_data)
             .build()
             .unwrap();

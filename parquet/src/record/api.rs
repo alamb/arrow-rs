@@ -27,7 +27,7 @@ use crate::data_type::{ByteArray, Decimal, Int96};
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 
-#[cfg(feature = "cli")]
+#[cfg(any(feature = "cli", test))]
 use serde_json::Value;
 
 /// Macro as a shortcut to generate 'not yet implemented' panic error.
@@ -79,7 +79,7 @@ impl Row {
         }
     }
 
-    #[cfg(feature = "cli")]
+    #[cfg(any(feature = "cli", test))]
     pub fn to_json_value(&self) -> Value {
         Value::Object(
             self.fields
@@ -650,7 +650,7 @@ impl Field {
         }
     }
 
-    #[cfg(feature = "cli")]
+    #[cfg(any(feature = "cli", test))]
     pub fn to_json_value(&self) -> Value {
         match &self {
             Field::Null => Value::Null,
@@ -669,7 +669,7 @@ impl Field {
             Field::Double(n) => serde_json::Number::from_f64(*n)
                 .map(Value::Number)
                 .unwrap_or(Value::Null),
-            Field::Decimal(n) => Value::String(convert_decimal_to_string(&n)),
+            Field::Decimal(n) => Value::String(convert_decimal_to_string(n)),
             Field::Str(s) => Value::String(s.to_owned()),
             Field::Bytes(b) => Value::String(base64::encode(b.data())),
             Field::Date(d) => Value::String(convert_date_to_string(*d)),
@@ -716,15 +716,19 @@ impl fmt::Display for Field {
             Field::Float(value) => {
                 if !(1e-15..=1e19).contains(&value) {
                     write!(f, "{:E}", value)
+                } else if value.trunc() == value {
+                    write!(f, "{}.0", value)
                 } else {
-                    write!(f, "{:?}", value)
+                    write!(f, "{}", value)
                 }
             }
             Field::Double(value) => {
                 if !(1e-15..=1e19).contains(&value) {
                     write!(f, "{:E}", value)
+                } else if value.trunc() == value {
+                    write!(f, "{}.0", value)
                 } else {
-                    write!(f, "{:?}", value)
+                    write!(f, "{}", value)
                 }
             }
             Field::Decimal(ref value) => {
@@ -1372,8 +1376,8 @@ mod tests {
         assert_eq!(4, row.get_ushort(7).unwrap());
         assert_eq!(5, row.get_uint(8).unwrap());
         assert_eq!(6, row.get_ulong(9).unwrap());
-        assert!(7.1 - row.get_float(10).unwrap() < f32::EPSILON);
-        assert!(8.1 - row.get_double(11).unwrap() < f64::EPSILON);
+        assert!((7.1 - row.get_float(10).unwrap()).abs() < f32::EPSILON);
+        assert!((8.1 - row.get_double(11).unwrap()).abs() < f64::EPSILON);
         assert_eq!("abc", row.get_string(12).unwrap());
         assert_eq!(5, row.get_bytes(13).unwrap().len());
         assert_eq!(7, row.get_decimal(14).unwrap().precision());
@@ -1520,10 +1524,10 @@ mod tests {
             Field::Float(9.2),
             Field::Float(10.3),
         ]);
-        assert!(10.3 - list.get_float(2).unwrap() < f32::EPSILON);
+        assert!((10.3 - list.get_float(2).unwrap()).abs() < f32::EPSILON);
 
         let list = make_list(vec![Field::Double(3.1415)]);
-        assert!(3.1415 - list.get_double(0).unwrap() < f64::EPSILON);
+        assert!((3.1415 - list.get_double(0).unwrap()).abs() < f64::EPSILON);
 
         let list = make_list(vec![Field::Str("abc".to_string())]);
         assert_eq!(&"abc".to_string(), list.get_string(0).unwrap());
@@ -1664,7 +1668,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cli")]
+    #[cfg(any(feature = "cli", test))]
     fn test_to_json_value() {
         assert_eq!(Field::Null.to_json_value(), Value::Null);
         assert_eq!(Field::Bool(true).to_json_value(), Value::Bool(true));
@@ -1703,21 +1707,19 @@ mod tests {
         );
         assert_eq!(
             Field::Float(5.0).to_json_value(),
-            Value::Number(serde_json::Number::from_f64(f64::from(5.0 as f32)).unwrap())
+            Value::Number(serde_json::Number::from_f64(5.0).unwrap())
         );
         assert_eq!(
             Field::Float(5.1234).to_json_value(),
-            Value::Number(
-                serde_json::Number::from_f64(f64::from(5.1234 as f32)).unwrap()
-            )
+            Value::Number(serde_json::Number::from_f64(5.1234_f32 as f64).unwrap())
         );
         assert_eq!(
             Field::Double(6.0).to_json_value(),
-            Value::Number(serde_json::Number::from_f64(6.0 as f64).unwrap())
+            Value::Number(serde_json::Number::from_f64(6.0).unwrap())
         );
         assert_eq!(
             Field::Double(6.1234).to_json_value(),
-            Value::Number(serde_json::Number::from_f64(6.1234 as f64).unwrap())
+            Value::Number(serde_json::Number::from_f64(6.1234).unwrap())
         );
         assert_eq!(
             Field::Str("abc".to_string()).to_json_value(),

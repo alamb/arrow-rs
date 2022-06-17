@@ -17,7 +17,7 @@
 
 //! Utilities for converting between IPC types and native Arrow types
 
-use crate::datatypes::{DataType, Field, IntervalUnit, Schema, TimeUnit};
+use crate::datatypes::{DataType, Field, IntervalUnit, Schema, TimeUnit, UnionMode};
 use crate::error::{ArrowError, Result};
 use crate::ipc;
 
@@ -72,7 +72,7 @@ pub fn schema_to_fb_offset<'a>(
 /// Convert an IPC Field to Arrow Field
 impl<'a> From<ipc::Field<'a>> for Field {
     fn from(field: ipc::Field) -> Field {
-        let mut arrow_field = if let Some(dictionary) = field.dictionary() {
+        let arrow_field = if let Some(dictionary) = field.dictionary() {
             Field::new_dict(
                 field.name().unwrap(),
                 get_data_type(field, true),
@@ -99,8 +99,7 @@ impl<'a> From<ipc::Field<'a>> for Field {
             metadata = Some(metadata_map);
         }
 
-        arrow_field.set_metadata(metadata);
-        arrow_field
+        arrow_field.with_metadata(metadata)
     }
 }
 
@@ -263,6 +262,9 @@ pub(crate) fn get_data_type(field: ipc::Field, may_be_dictionary: bool) -> DataT
                     DataType::Interval(IntervalUnit::YearMonth)
                 }
                 ipc::IntervalUnit::DAY_TIME => DataType::Interval(IntervalUnit::DayTime),
+                ipc::IntervalUnit::MONTH_DAY_NANO => {
+                    DataType::Interval(IntervalUnit::MonthDayNano)
+                }
                 z => panic!("Interval type with unit of {:?} unsupported", z),
             }
         }
@@ -319,6 +321,29 @@ pub(crate) fn get_data_type(field: ipc::Field, may_be_dictionary: bool) -> DataT
         ipc::Type::Decimal => {
             let fsb = field.type_as_decimal().unwrap();
             DataType::Decimal(fsb.precision() as usize, fsb.scale() as usize)
+        }
+        ipc::Type::Union => {
+            let union = field.type_as_union().unwrap();
+
+            let union_mode = match union.mode() {
+                ipc::UnionMode::Dense => UnionMode::Dense,
+                ipc::UnionMode::Sparse => UnionMode::Sparse,
+                mode => panic!("Unexpected union mode: {:?}", mode),
+            };
+
+            let mut fields = vec![];
+            if let Some(children) = field.children() {
+                for i in 0..children.len() {
+                    fields.push(children.get(i).into());
+                }
+            };
+
+            let type_ids: Vec<i8> = match union.typeIds() {
+                None => (0_i8..fields.len() as i8).collect(),
+                Some(ids) => ids.iter().map(|i| i as i8).collect(),
+            };
+
+            DataType::Union(fields, type_ids, union_mode)
         }
         t => unimplemented!("Type {:?} not supported", t),
     }
@@ -533,7 +558,7 @@ pub(crate) fn get_fb_field_type<'a>(
             }
         }
         Timestamp(unit, tz) => {
-            let tz = tz.clone().unwrap_or_else(String::new);
+            let tz = tz.clone().unwrap_or_default();
             let tz_str = fbb.create_string(tz.as_str());
             let mut builder = ipc::TimestampBuilder::new(fbb);
             let time_unit = match unit {
@@ -557,6 +582,7 @@ pub(crate) fn get_fb_field_type<'a>(
             let interval_unit = match unit {
                 IntervalUnit::YearMonth => ipc::IntervalUnit::YEAR_MONTH,
                 IntervalUnit::DayTime => ipc::IntervalUnit::DAY_TIME,
+                IntervalUnit::MonthDayNano => ipc::IntervalUnit::MONTH_DAY_NANO,
             };
             builder.add_unit(interval_unit);
             FBFieldType {
@@ -645,7 +671,29 @@ pub(crate) fn get_fb_field_type<'a>(
                 children: Some(fbb.create_vector(&empty_fields[..])),
             }
         }
-        t => unimplemented!("Type {:?} not supported", t),
+        Union(fields, type_ids, mode) => {
+            let mut children = vec![];
+            for field in fields {
+                children.push(build_field(fbb, field));
+            }
+
+            let union_mode = match mode {
+                UnionMode::Sparse => ipc::UnionMode::Sparse,
+                UnionMode::Dense => ipc::UnionMode::Dense,
+            };
+
+            let fbb_type_ids = fbb
+                .create_vector(&type_ids.iter().map(|t| *t as i32).collect::<Vec<_>>());
+            let mut builder = ipc::UnionBuilder::new(fbb);
+            builder.add_mode(union_mode);
+            builder.add_typeIds(fbb_type_ids);
+
+            FBFieldType {
+                type_type: ipc::Type::Union,
+                type_: builder.finish().as_union_value(),
+                children: Some(fbb.create_vector(&children[..])),
+            }
+        }
     }
 }
 
@@ -687,7 +735,7 @@ pub(crate) fn get_fb_dictionary<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datatypes::{DataType, Field, Schema};
+    use crate::datatypes::{DataType, Field, Schema, UnionMode};
 
     #[test]
     fn convert_schema_round_trip() {
@@ -701,11 +749,7 @@ mod tests {
             .collect();
         let schema = Schema::new_with_metadata(
             vec![
-                {
-                    let mut f = Field::new("uint8", DataType::UInt8, false);
-                    f.set_metadata(Some(field_md));
-                    f
-                },
+                Field::new("uint8", DataType::UInt8, false).with_metadata(Some(field_md)),
                 Field::new("uint16", DataType::UInt16, true),
                 Field::new("uint32", DataType::UInt32, false),
                 Field::new("uint64", DataType::UInt64, true),
@@ -755,6 +799,11 @@ mod tests {
                 Field::new(
                     "interval[dt]",
                     DataType::Interval(IntervalUnit::DayTime),
+                    true,
+                ),
+                Field::new(
+                    "interval[mdn]",
+                    DataType::Interval(IntervalUnit::MonthDayNano),
                     true,
                 ),
                 Field::new("utf8", DataType::Utf8, false),
@@ -816,7 +865,68 @@ mod tests {
                     ]),
                     false,
                 ),
+                Field::new(
+                    "union<int64, list[union<date32, list[union<>]>]>",
+                    DataType::Union(
+                        vec![
+                            Field::new("int64", DataType::Int64, true),
+                            Field::new(
+                                "list[union<date32, list[union<>]>]",
+                                DataType::List(Box::new(Field::new(
+                                    "union<date32, list[union<>]>",
+                                    DataType::Union(
+                                        vec![
+                                            Field::new("date32", DataType::Date32, true),
+                                            Field::new(
+                                                "list[union<>]",
+                                                DataType::List(Box::new(Field::new(
+                                                    "union",
+                                                    DataType::Union(
+                                                        vec![],
+                                                        vec![],
+                                                        UnionMode::Sparse,
+                                                    ),
+                                                    false,
+                                                ))),
+                                                false,
+                                            ),
+                                        ],
+                                        vec![0, 1],
+                                        UnionMode::Dense,
+                                    ),
+                                    false,
+                                ))),
+                                false,
+                            ),
+                        ],
+                        vec![0, 1],
+                        UnionMode::Sparse,
+                    ),
+                    false,
+                ),
                 Field::new("struct<>", DataType::Struct(vec![]), true),
+                Field::new(
+                    "union<>",
+                    DataType::Union(vec![], vec![], UnionMode::Dense),
+                    true,
+                ),
+                Field::new(
+                    "union<>",
+                    DataType::Union(vec![], vec![], UnionMode::Sparse),
+                    true,
+                ),
+                Field::new(
+                    "union<int32, utf8>",
+                    DataType::Union(
+                        vec![
+                            Field::new("int32", DataType::Int32, true),
+                            Field::new("utf8", DataType::Utf8, true),
+                        ],
+                        vec![2, 3], // non-default type ids
+                        UnionMode::Dense,
+                    ),
+                    true,
+                ),
                 Field::new_dict(
                     "dictionary<int32, utf8>",
                     DataType::Dictionary(

@@ -15,16 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Provides API for reading/writing Arrow
+//! [RecordBatch](arrow::record_batch::RecordBatch)es and
+//! [Array](arrow::array::Array)s to/from Parquet Files.
+//!
 //! [Apache Arrow](http://arrow.apache.org/) is a cross-language development platform for
 //! in-memory data.
-//!
-//! This mod provides API for converting between arrow and parquet.
 //!
 //!# Example of writing Arrow record batch to Parquet file
 //!
 //!```rust
-//! use arrow::array::Int32Array;
-//! use arrow::datatypes::{DataType, Field, Schema};
+//! use arrow::array::{Int32Array, ArrayRef};
 //! use arrow::record_batch::RecordBatch;
 //! use parquet::arrow::arrow_writer::ArrowWriter;
 //! use parquet::file::properties::WriterProperties;
@@ -32,25 +33,21 @@
 //! use std::sync::Arc;
 //! let ids = Int32Array::from(vec![1, 2, 3, 4]);
 //! let vals = Int32Array::from(vec![5, 6, 7, 8]);
-//! let schema = Arc::new(Schema::new(vec![
-//!     Field::new("id", DataType::Int32, false),
-//!     Field::new("val", DataType::Int32, false),
-//! ]));
+//! let batch = RecordBatch::try_from_iter(vec![
+//!   ("id", Arc::new(ids) as ArrayRef),
+//!   ("val", Arc::new(vals) as ArrayRef),
+//! ]).unwrap();
 //!
 //! let file = File::create("data.parquet").unwrap();
-//!
-//! let batch =
-//!     RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ids), Arc::new(vals)]).unwrap();
-//! let batches = vec![batch];
 //!
 //! // Default writer properties
 //! let props = WriterProperties::builder().build();
 //!
-//! let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), Some(props)).unwrap();
+//! let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
 //!
-//! for batch in batches {
-//!     writer.write(&batch).expect("Writing batch");
-//! }
+//! writer.write(&batch).expect("Writing batch");
+//!
+//! // writer must be closed to write footer
 //! writer.close().unwrap();
 //! ```
 //!
@@ -70,8 +67,8 @@
 //!
 //! ```rust
 //! use arrow::record_batch::RecordBatchReader;
-//! use parquet::file::reader::SerializedFileReader;
-//! use parquet::arrow::{ParquetFileArrowReader, ArrowReader};
+//! use parquet::file::reader::{FileReader, SerializedFileReader};
+//! use parquet::arrow::{ParquetFileArrowReader, ArrowReader, ProjectionMask};
 //! use std::sync::Arc;
 //! use std::fs::File;
 //!
@@ -99,14 +96,18 @@
 //! # writer.close().unwrap();
 //!
 //! let file = File::open("data.parquet").unwrap();
-//! let file_reader = SerializedFileReader::new(file).unwrap();
-//! let mut arrow_reader = ParquetFileArrowReader::new(Arc::new(file_reader));
+//!
+//! let mut arrow_reader = ParquetFileArrowReader::try_new(file).unwrap();
+//! let mask = ProjectionMask::leaves(arrow_reader.parquet_schema(), [0]);
 //!
 //! println!("Converted arrow schema is: {}", arrow_reader.get_schema().unwrap());
 //! println!("Arrow schema after projection is: {}",
-//!    arrow_reader.get_schema_by_columns(vec![0], true).unwrap());
+//! arrow_reader.get_schema_by_columns(mask.clone()).unwrap());
 //!
-//! let mut record_batch_reader = arrow_reader.get_record_reader(2048).unwrap();
+//! let mut unprojected = arrow_reader.get_record_reader(2048).unwrap();
+//! println!("Unprojected reader schema: {}", unprojected.schema());
+//!
+//! let mut record_batch_reader = arrow_reader.get_record_reader_by_columns(mask, 2048).unwrap();
 //!
 //! for maybe_record_batch in record_batch_reader {
 //!    let record_batch = maybe_record_batch.unwrap();
@@ -118,22 +119,114 @@
 //!}
 //! ```
 
-pub mod array_reader;
-pub mod arrow_array_reader;
+experimental_mod!(array_reader);
 pub mod arrow_reader;
 pub mod arrow_writer;
-pub mod converter;
-pub(in crate::arrow) mod levels;
-pub(in crate::arrow) mod record_reader;
-pub mod schema;
+mod buffer;
+
+#[cfg(feature = "async")]
+pub mod async_reader;
+
+mod record_reader;
+experimental_mod!(schema);
 
 pub use self::arrow_reader::ArrowReader;
 pub use self::arrow_reader::ParquetFileArrowReader;
 pub use self::arrow_writer::ArrowWriter;
+#[cfg(feature = "async")]
+pub use self::async_reader::ParquetRecordBatchStreamBuilder;
+use crate::schema::types::SchemaDescriptor;
+
 pub use self::schema::{
     arrow_to_parquet_schema, parquet_to_arrow_schema, parquet_to_arrow_schema_by_columns,
-    parquet_to_arrow_schema_by_root_columns,
 };
 
 /// Schema metadata key used to store serialized Arrow IPC schema
 pub const ARROW_SCHEMA_META_KEY: &str = "ARROW:schema";
+
+/// A [`ProjectionMask`] identifies a set of columns within a potentially nested schema to project
+///
+/// In particular, a [`ProjectionMask`] can be constructed from a list of leaf column indices
+/// or root column indices where:
+///
+/// * Root columns are the direct children of the root schema, enumerated in order
+/// * Leaf columns are the child-less leaves of the schema as enumerated by a depth-first search
+///
+/// For example, the schema
+///
+/// ```ignore
+/// message schema {
+///   REQUIRED boolean         leaf_1;
+///   REQUIRED GROUP group {
+///     OPTIONAL int32 leaf_2;
+///     OPTIONAL int64 leaf_3;
+///   }
+/// }
+/// ```
+///
+/// Has roots `["leaf_1", "group"]` and leaves `["leaf_1", "leaf_2", "leaf_3"]`
+///
+/// For non-nested schemas, i.e. those containing only primitive columns, the root
+/// and leaves are the same
+///
+#[derive(Debug, Clone)]
+pub struct ProjectionMask {
+    /// If present a leaf column should be included if the value at
+    /// the corresponding index is true
+    ///
+    /// If `None`, include all columns
+    mask: Option<Vec<bool>>,
+}
+
+impl ProjectionMask {
+    /// Create a [`ProjectionMask`] which selects all columns
+    pub fn all() -> Self {
+        Self { mask: None }
+    }
+
+    /// Create a [`ProjectionMask`] which selects only the specified leaf columns
+    ///
+    /// Note: repeated or out of order indices will not impact the final mask
+    ///
+    /// i.e. `[0, 1, 2]` will construct the same mask as `[1, 0, 0, 2]`
+    pub fn leaves(
+        schema: &SchemaDescriptor,
+        indices: impl IntoIterator<Item = usize>,
+    ) -> Self {
+        let mut mask = vec![false; schema.num_columns()];
+        for leaf_idx in indices {
+            mask[leaf_idx] = true;
+        }
+        Self { mask: Some(mask) }
+    }
+
+    /// Create a [`ProjectionMask`] which selects only the specified root columns
+    ///
+    /// Note: repeated or out of order indices will not impact the final mask
+    ///
+    /// i.e. `[0, 1, 2]` will construct the same mask as `[1, 0, 0, 2]`
+    pub fn roots(
+        schema: &SchemaDescriptor,
+        indices: impl IntoIterator<Item = usize>,
+    ) -> Self {
+        let num_root_columns = schema.root_schema().get_fields().len();
+        let mut root_mask = vec![false; num_root_columns];
+        for root_idx in indices {
+            root_mask[root_idx] = true;
+        }
+
+        let mask = (0..schema.num_columns())
+            .map(|leaf_idx| {
+                let root_idx = schema.get_column_root_idx(leaf_idx);
+                root_mask[root_idx]
+            })
+            .collect();
+
+        Self { mask: Some(mask) }
+    }
+
+    /// Returns true if the leaf column `leaf_idx` is included by the mask
+    pub fn leaf_included(&self, leaf_idx: usize) -> bool {
+        self.mask.as_ref().map(|m| m[leaf_idx]).unwrap_or(true)
+    }
+}

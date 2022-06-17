@@ -21,7 +21,8 @@ use multiversion::multiversion;
 use std::ops::Add;
 
 use crate::array::{
-    Array, BooleanArray, GenericStringArray, PrimitiveArray, StringOffsetSizeTrait,
+    Array, BooleanArray, GenericBinaryArray, GenericStringArray, OffsetSizeTrait,
+    PrimitiveArray,
 };
 use crate::datatypes::{ArrowNativeType, ArrowNumericType};
 
@@ -30,41 +31,6 @@ use crate::datatypes::{ArrowNativeType, ArrowNumericType};
 fn is_nan<T: ArrowNativeType + PartialOrd + Copy>(a: T) -> bool {
     #[allow(clippy::eq_op)]
     !(a == a)
-}
-
-/// Helper macro to perform min/max of strings
-fn min_max_string<T: StringOffsetSizeTrait, F: Fn(&str, &str) -> bool>(
-    array: &GenericStringArray<T>,
-    cmp: F,
-) -> Option<&str> {
-    let null_count = array.null_count();
-
-    if null_count == array.len() {
-        return None;
-    }
-    let data = array.data();
-    let mut n;
-    if null_count == 0 {
-        n = array.value(0);
-        for i in 1..data.len() {
-            let item = array.value(i);
-            if cmp(n, item) {
-                n = item;
-            }
-        }
-    } else {
-        n = "";
-        let mut has_value = false;
-
-        for i in 0..data.len() {
-            let item = array.value(i);
-            if data.is_valid(i) && (!has_value || cmp(n, item)) {
-                has_value = true;
-                n = item;
-            }
-        }
-    }
-    Some(n)
 }
 
 /// Returns the minimum value in the array, according to the natural order.
@@ -87,20 +53,6 @@ where
     T::Native: ArrowNativeType,
 {
     min_max_helper(array, |a, b| (!is_nan(*a) & is_nan(*b)) || a < b)
-}
-
-/// Returns the maximum value in the string array, according to the natural order.
-pub fn max_string<T: StringOffsetSizeTrait>(
-    array: &GenericStringArray<T>,
-) -> Option<&str> {
-    min_max_string(array, |a, b| a < b)
-}
-
-/// Returns the minimum value in the string array, according to the natural order.
-pub fn min_string<T: StringOffsetSizeTrait>(
-    array: &GenericStringArray<T>,
-) -> Option<&str> {
-    min_max_string(array, |a, b| a > b)
 }
 
 /// Helper function to perform min/max lambda function on values from a numeric array.
@@ -188,6 +140,48 @@ pub fn max_boolean(array: &BooleanArray) -> Option<bool> {
         .find(|&b| b == Some(true))
         .flatten()
         .or(Some(false))
+}
+
+/// Helper to compute min/max of [`GenericStringArray`] and [`GenericBinaryArray`]
+macro_rules! min_max_binary_string {
+    ($array: expr, $cmp: expr) => {{
+        let null_count = $array.null_count();
+        if null_count == $array.len() {
+            None
+        } else if null_count == 0 {
+            // JUSTIFICATION
+            //  Benefit:  ~8% speedup
+            //  Soundness: `i` is always within the array bounds
+            (0..$array.len())
+                .map(|i| unsafe { $array.value_unchecked(i) })
+                .reduce(|acc, item| if $cmp(acc, item) { item } else { acc })
+        } else {
+            $array
+                .iter()
+                .flatten()
+                .reduce(|acc, item| if $cmp(acc, item) { item } else { acc })
+        }
+    }};
+}
+
+/// Returns the maximum value in the binary array, according to the natural order.
+pub fn max_binary<T: OffsetSizeTrait>(array: &GenericBinaryArray<T>) -> Option<&[u8]> {
+    min_max_binary_string!(array, |a, b| a < b)
+}
+
+/// Returns the minimum value in the binary array, according to the natural order.
+pub fn min_binary<T: OffsetSizeTrait>(array: &GenericBinaryArray<T>) -> Option<&[u8]> {
+    min_max_binary_string!(array, |a, b| a > b)
+}
+
+/// Returns the maximum value in the string array, according to the natural order.
+pub fn max_string<T: OffsetSizeTrait>(array: &GenericStringArray<T>) -> Option<&str> {
+    min_max_binary_string!(array, |a, b| a < b)
+}
+
+/// Returns the minimum value in the string array, according to the natural order.
+pub fn min_string<T: OffsetSizeTrait>(array: &GenericStringArray<T>) -> Option<&str> {
+    min_max_binary_string!(array, |a, b| a > b)
 }
 
 /// Returns the sum of values in the array.
@@ -641,7 +635,7 @@ mod tests {
     #[test]
     fn test_primitive_array_float_sum() {
         let a = Float64Array::from(vec![1.1, 2.2, 3.3, 4.4, 5.5]);
-        assert!(16.5 - sum(&a).unwrap() < f64::EPSILON);
+        assert_eq!(16.5, sum(&a).unwrap());
     }
 
     #[test]
@@ -900,10 +894,44 @@ mod tests {
     }
 
     #[test]
+    fn test_binary_min_max_with_nulls() {
+        let a = BinaryArray::from(vec![
+            Some("b".as_bytes()),
+            None,
+            None,
+            Some(b"a"),
+            Some(b"c"),
+        ]);
+        assert_eq!(Some("a".as_bytes()), min_binary(&a));
+        assert_eq!(Some("c".as_bytes()), max_binary(&a));
+    }
+
+    #[test]
+    fn test_binary_min_max_no_null() {
+        let a = BinaryArray::from(vec![Some("b".as_bytes()), Some(b"a"), Some(b"c")]);
+        assert_eq!(Some("a".as_bytes()), min_binary(&a));
+        assert_eq!(Some("c".as_bytes()), max_binary(&a));
+    }
+
+    #[test]
+    fn test_binary_min_max_all_nulls() {
+        let a = BinaryArray::from(vec![None, None]);
+        assert_eq!(None, min_binary(&a));
+        assert_eq!(None, max_binary(&a));
+    }
+
+    #[test]
+    fn test_binary_min_max_1() {
+        let a = BinaryArray::from(vec![None, None, Some("b".as_bytes()), Some(b"a")]);
+        assert_eq!(Some("a".as_bytes()), min_binary(&a));
+        assert_eq!(Some("b".as_bytes()), max_binary(&a));
+    }
+
+    #[test]
     fn test_string_min_max_with_nulls() {
         let a = StringArray::from(vec![Some("b"), None, None, Some("a"), Some("c")]);
-        assert_eq!("a", min_string(&a).unwrap());
-        assert_eq!("c", max_string(&a).unwrap());
+        assert_eq!(Some("a"), min_string(&a));
+        assert_eq!(Some("c"), max_string(&a));
     }
 
     #[test]

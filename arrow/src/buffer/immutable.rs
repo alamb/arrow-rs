@@ -21,12 +21,10 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::{convert::AsRef, usize};
 
-use crate::util::bit_chunk_iterator::BitChunks;
-use crate::{
-    bytes::{Bytes, Deallocation},
-    datatypes::ArrowNativeType,
-    ffi,
-};
+use crate::alloc::{Allocation, Deallocation};
+use crate::ffi::FFI_ArrowArray;
+use crate::util::bit_chunk_iterator::{BitChunks, UnalignedBitChunk};
+use crate::{bytes::Bytes, datatypes::ArrowNativeType};
 
 use super::ops::bitwise_unary_op_helper;
 use super::MutableBuffer;
@@ -76,7 +74,7 @@ impl Buffer {
     /// bytes. If the `ptr` and `capacity` come from a `Buffer`, then this is guaranteed.
     pub unsafe fn from_raw_parts(ptr: NonNull<u8>, len: usize, capacity: usize) -> Self {
         assert!(len <= capacity);
-        Buffer::build_with_arguments(ptr, len, Deallocation::Native(capacity))
+        Buffer::build_with_arguments(ptr, len, Deallocation::Arrow(capacity))
     }
 
     /// Creates a buffer from an existing memory region (must already be byte-aligned), this
@@ -86,18 +84,41 @@ impl Buffer {
     ///
     /// * `ptr` - Pointer to raw parts
     /// * `len` - Length of raw parts in **bytes**
-    /// * `data` - An [ffi::FFI_ArrowArray] with the data
+    /// * `data` - An [crate::ffi::FFI_ArrowArray] with the data
     ///
     /// # Safety
     ///
     /// This function is unsafe as there is no guarantee that the given pointer is valid for `len`
     /// bytes and that the foreign deallocator frees the region.
+    #[deprecated(
+        note = "use from_custom_allocation instead which makes it clearer that the allocation is in fact owned"
+    )]
     pub unsafe fn from_unowned(
         ptr: NonNull<u8>,
         len: usize,
-        data: Arc<ffi::FFI_ArrowArray>,
+        data: Arc<FFI_ArrowArray>,
     ) -> Self {
-        Buffer::build_with_arguments(ptr, len, Deallocation::Foreign(data))
+        Self::from_custom_allocation(ptr, len, data)
+    }
+
+    /// Creates a buffer from an existing memory region. Ownership of the memory is tracked via reference counting
+    /// and the memory will be freed using the `drop` method of [crate::alloc::Allocation] when the reference count reaches zero.
+    ///
+    /// # Arguments
+    ///
+    /// * `ptr` - Pointer to raw parts
+    /// * `len` - Length of raw parts in **bytes**
+    /// * `owner` - A [crate::alloc::Allocation] which is responsible for freeing that data
+    ///
+    /// # Safety
+    ///
+    /// This function is unsafe as there is no guarantee that the given pointer is valid for `len` bytes
+    pub unsafe fn from_custom_allocation(
+        ptr: NonNull<u8>,
+        len: usize,
+        owner: Arc<dyn Allocation>,
+    ) -> Self {
+        Buffer::build_with_arguments(ptr, len, Deallocation::Custom(owner))
     }
 
     /// Auxiliary method to create a new Buffer
@@ -119,7 +140,7 @@ impl Buffer {
     }
 
     /// Returns the capacity of this buffer.
-    /// For exernally owned buffers, this returns zero
+    /// For externally owned buffers, this returns zero
     pub fn capacity(&self) -> usize {
         self.data.capacity()
     }
@@ -153,29 +174,22 @@ impl Buffer {
     ///
     /// Note that this should be used cautiously, and the returned pointer should not be
     /// stored anywhere, to avoid dangling pointers.
+    #[inline]
     pub fn as_ptr(&self) -> *const u8 {
         unsafe { self.data.ptr().as_ptr().add(self.offset) }
     }
 
     /// View buffer as typed slice.
     ///
-    /// # Safety
+    /// # Panics
     ///
-    /// `ArrowNativeType` is public so that it can be used as a trait bound for other public
-    /// components, such as the `ToByteSlice` trait.  However, this means that it can be
-    /// implemented by user defined types, which it is not intended for.
-    ///
-    /// Also `typed_data::<bool>` is unsafe as `0x00` and `0x01` are the only valid values for
-    /// `bool` in Rust.  However, `bool` arrays in Arrow are bit-packed which breaks this condition.
-    /// View buffer as typed slice.
-    pub unsafe fn typed_data<T: ArrowNativeType + num::Num>(&self) -> &[T] {
-        // JUSTIFICATION
-        //  Benefit
-        //      Many of the buffers represent specific types, and consumers of `Buffer` often need to re-interpret them.
-        //  Soundness
-        //      * The pointer is non-null by construction
-        //      * alignment asserted below.
-        let (prefix, offsets, suffix) = self.as_slice().align_to::<T>();
+    /// This function panics if the underlying buffer is not aligned
+    /// correctly for type `T`.
+    pub fn typed_data<T: ArrowNativeType>(&self) -> &[T] {
+        // SAFETY
+        // ArrowNativeType is trivially transmutable, is sealed to prevent potentially incorrect
+        // implementation outside this crate, and this method checks alignment
+        let (prefix, offsets, suffix) = unsafe { self.as_slice().align_to::<T>() };
         assert!(prefix.is_empty() && suffix.is_empty());
         offsets
     }
@@ -208,11 +222,7 @@ impl Buffer {
     /// Returns the number of 1-bits in this buffer, starting from `offset` with `length` bits
     /// inspected. Note that both `offset` and `length` are measured in bits.
     pub fn count_set_bits_offset(&self, offset: usize, len: usize) -> usize {
-        let chunks = self.bit_chunks(offset, len);
-        let mut count = chunks.iter().map(|c| c.count_ones() as usize).sum();
-        count += chunks.remainder_bits().count_ones() as usize;
-
-        count
+        UnalignedBitChunk::new(self.as_slice(), offset, len).count_ones()
     }
 }
 
@@ -248,6 +258,8 @@ impl std::ops::Deref for Buffer {
 }
 
 unsafe impl Sync for Buffer {}
+// false positive, see https://github.com/apache/arrow-rs/pull/1169
+#[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for Buffer {}
 
 impl From<MutableBuffer> for Buffer {
@@ -326,6 +338,7 @@ impl<T: ArrowNativeType> FromIterator<T> for Buffer {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{RefUnwindSafe, UnwindSafe};
     use std::thread;
 
     use super::*;
@@ -434,7 +447,7 @@ mod tests {
     macro_rules! check_as_typed_data {
         ($input: expr, $native_t: ty) => {{
             let buffer = Buffer::from_slice_ref($input);
-            let slice: &[$native_t] = unsafe { buffer.typed_data::<$native_t>() };
+            let slice: &[$native_t] = buffer.typed_data::<$native_t>();
             assert_eq!($input, slice);
         }};
     }
@@ -537,5 +550,31 @@ mod tests {
             4,
             Buffer::from(&[0b01101101, 0b10101010]).count_set_bits_offset(7, 9)
         );
+    }
+
+    #[test]
+    fn test_unwind_safe() {
+        fn assert_unwind_safe<T: RefUnwindSafe + UnwindSafe>() {}
+        assert_unwind_safe::<Buffer>()
+    }
+
+    #[test]
+    fn test_from_foreign_vec() {
+        let mut vector = vec![1_i32, 2, 3, 4, 5];
+        let buffer = unsafe {
+            Buffer::from_custom_allocation(
+                NonNull::new_unchecked(vector.as_mut_ptr() as *mut u8),
+                vector.len() * std::mem::size_of::<i32>(),
+                Arc::new(vector),
+            )
+        };
+
+        let slice = buffer.typed_data::<i32>();
+        assert_eq!(slice, &[1, 2, 3, 4, 5]);
+
+        let buffer = buffer.slice(std::mem::size_of::<i32>());
+
+        let slice = buffer.typed_data::<i32>();
+        assert_eq!(slice, &[2, 3, 4, 5]);
     }
 }

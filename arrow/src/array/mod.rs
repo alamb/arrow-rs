@@ -15,42 +15,66 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The central type in Apache Arrow are arrays, represented
-//! by the [`Array` trait](crate::array::Array).
-//! An array represents a known-length sequence of values all
-//! having the same type.
+//! The central type in Apache Arrow are arrays, which are a known-length sequence of values
+//! all having the same type. This module provides concrete implementations of each type, as
+//! well as an [`Array`] trait that can be used for type-erasure.
 //!
-//! Internally, those values are represented by one or several
-//! [buffers](crate::buffer::Buffer), the number and meaning
-//! of which depend on the array’s data type, as documented in
-//! [the Arrow data layout specification](https://arrow.apache.org/docs/format/Columnar.html).
-//! For example, the type `Int16Array` represents an Apache
-//! Arrow array of 16-bit integers.
+//! # Downcasting an Array
 //!
-//! Those buffers consist of the value data itself and an
-//! optional [bitmap buffer](crate::bitmap::Bitmap) that
-//! indicates which array entries are null values.
-//! The bitmap buffer can be entirely omitted if the array is
-//! known to have zero null values.
+//! Arrays are often passed around as a dynamically typed [`&dyn Array`] or [`ArrayRef`].
+//! For example, [`RecordBatch`](`crate::record_batch::RecordBatch`) stores columns as [`ArrayRef`].
 //!
-//! There are concrete implementations of this trait for each
-//! data type, that help you access individual values of the
-//! array.
+//! Whilst these arrays can be passed directly to the [`compute`](crate::compute),
+//! [`csv`](crate::csv), [`json`](crate::json), etc... APIs, it is often the case that you wish
+//! to interact with the data directly. This requires downcasting to the concrete type of the array:
+//!
+//! ```
+//! # use arrow::array::{Array, Float32Array, Int32Array};
+//! #
+//! fn sum_int32(array: &dyn Array) -> i32 {
+//!     let integers: &Int32Array = array.as_any().downcast_ref().unwrap();
+//!     integers.iter().map(|val| val.unwrap_or_default()).sum()
+//! }
+//!
+//! // Note: the values for positions corresponding to nulls will be arbitrary
+//! fn as_f32_slice(array: &dyn Array) -> &[f32] {
+//!     array.as_any().downcast_ref::<Float32Array>().unwrap().values()
+//! }
+//! ```
 //!
 //! # Building an Array
 //!
-//! Arrow's `Arrays` are immutable, but there is the trait
-//! [`ArrayBuilder`](crate::array::ArrayBuilder)
-//! that helps you with constructing new `Arrays`. As with the
-//! `Array` trait, there are builder implementations for all
-//! concrete array types.
+//! Most [`Array`] implementations can be constructed directly from iterators or [`Vec`]
 //!
-//! # Example
 //! ```
-//! extern crate arrow;
+//! # use arrow::array::Int32Array;
+//! # use arrow::array::StringArray;
+//! # use arrow::array::ListArray;
+//! # use arrow::datatypes::Int32Type;
+//! #
+//! Int32Array::from(vec![1, 2]);
+//! Int32Array::from(vec![Some(1), None]);
+//! Int32Array::from_iter([1, 2, 3, 4]);
+//! Int32Array::from_iter([Some(1), Some(2), None, Some(4)]);
 //!
-//! use arrow::array::Int16Array;
+//! StringArray::from(vec!["foo", "bar"]);
+//! StringArray::from(vec![Some("foo"), None]);
+//! StringArray::from_iter([Some("foo"), None]);
+//! StringArray::from_iter_values(["foo", "bar"]);
 //!
+//! ListArray::from_iter_primitive::<Int32Type, _, _>([
+//!     Some(vec![Some(1), None, Some(3)]),
+//!     None,
+//!     Some(vec![])
+//! ]);
+//! ```
+//!
+//! Additionally [`ArrayBuilder`](crate::array::ArrayBuilder) implementations can be
+//! used to construct arrays with a push-based interface
+//!
+//! ```
+//! # use arrow::array::Int16Array;
+//! #
 //! // Create a new builder with a capacity of 100
 //! let mut builder = Int16Array::builder(100);
 //!
@@ -80,6 +104,43 @@
 //!     "Get slice of len 2 starting at idx 3"
 //! )
 //! ```
+//!
+//! # Zero-Copy Slicing
+//!
+//! Given an [`Array`] of arbitrary length, it is possible to create an owned slice of this
+//! data. Internally this just increments some ref-counts, and so is incredibly cheap
+//!
+//! ```rust
+//! # use std::sync::Arc;
+//! # use arrow::array::{Array, Int32Array, ArrayRef};
+//! let array = Arc::new(Int32Array::from_iter([1, 2, 3])) as ArrayRef;
+//!
+//! // Slice with offset 1 and length 2
+//! let sliced = array.slice(1, 2);
+//! let ints = sliced.as_any().downcast_ref::<Int32Array>().unwrap();
+//! assert_eq!(ints.values(), &[2, 3]);
+//! ```
+//!
+//! # Internal Representation
+//!
+//! Internally, arrays are represented by one or several [`Buffer`], the number and meaning of
+//! which depend on the array’s data type, as documented in the [Arrow specification].
+//!
+//! For example, the type `Int16Array` represents an array of 16-bit integers and consists of:
+//!
+//! * An optional [`Bitmap`] identifying any null values
+//! * A contiguous [`Buffer`] of 16-bit integers
+//!
+//! Similarly, the type `StringArray` represents an array of UTF-8 strings and consists of:
+//!
+//! * An optional [`Bitmap`] identifying any null values
+//! * An offsets [`Buffer`] of 32-bit integers identifying valid UTF-8 sequences within the values buffer
+//! * A values [`Buffer`] of UTF-8 encoded string data
+//!
+//! [Arrow specification]: https://arrow.apache.org/docs/format/Columnar.html
+//! [`&dyn Array`]: Array
+//! [`Bitmap`]: crate::bitmap::Bitmap
+//! [`Buffer`]: crate::buffer::Buffer
 
 #[allow(clippy::module_inception)]
 mod array;
@@ -191,6 +252,14 @@ pub type UInt32Array = PrimitiveArray<UInt32Type>;
 /// let arr : UInt64Array = [Some(1), Some(2)].into_iter().collect();
 /// ```
 pub type UInt64Array = PrimitiveArray<UInt64Type>;
+///
+/// # Example: Using `collect`
+/// ```
+/// # use arrow::array::Float16Array;
+/// use half::f16;
+/// let arr : Float16Array = [Some(f16::from_f64(1.0)), Some(f16::from_f64(2.0))].into_iter().collect();
+/// ```
+pub type Float16Array = PrimitiveArray<Float16Type>;
 ///
 /// # Example: Using `collect`
 /// ```
@@ -318,10 +387,58 @@ pub type UInt32DictionaryArray = DictionaryArray<UInt32Type>;
 /// assert_eq!(array.values(), &values);
 /// ```
 pub type UInt64DictionaryArray = DictionaryArray<UInt64Type>;
-
+///
+/// A primitive array where each element is of type [TimestampSecondType].
+/// See also [`Timestamp`](crate::datatypes::DataType::Timestamp).
+///
+/// # Example: UTC timestamps post epoch
+/// ```
+/// # use arrow::array::TimestampSecondArray;
+/// use chrono::FixedOffset;
+/// // Corresponds to single element array with entry 1970-05-09T14:25:11+0:00
+/// let arr = TimestampSecondArray::from_vec(vec![11111111], None);
+/// // OR
+/// let arr = TimestampSecondArray::from_opt_vec(vec![Some(11111111)], None);
+/// let utc_offset = FixedOffset::east(0);
+///
+/// assert_eq!(arr.value_as_datetime_with_tz(0, utc_offset).map(|v| v.to_string()).unwrap(), "1970-05-09 14:25:11")
+/// ```
+///
+/// # Example: UTC timestamps pre epoch
+/// ```
+/// # use arrow::array::TimestampSecondArray;
+/// use chrono::FixedOffset;
+/// // Corresponds to single element array with entry 1969-08-25T09:34:49+0:00
+/// let arr = TimestampSecondArray::from_vec(vec![-11111111], None);
+/// // OR
+/// let arr = TimestampSecondArray::from_opt_vec(vec![Some(-11111111)], None);
+/// let utc_offset = FixedOffset::east(0);
+///
+/// assert_eq!(arr.value_as_datetime_with_tz(0, utc_offset).map(|v| v.to_string()).unwrap(), "1969-08-25 09:34:49")
+/// ```
+///
+/// # Example: With timezone specified
+/// ```
+/// # use arrow::array::TimestampSecondArray;
+/// use chrono::FixedOffset;
+/// // Corresponds to single element array with entry 1970-05-10T00:25:11+10:00
+/// let arr = TimestampSecondArray::from_vec(vec![11111111], Some("+10:00".to_string()));
+/// // OR
+/// let arr = TimestampSecondArray::from_opt_vec(vec![Some(11111111)], Some("+10:00".to_string()));
+/// let sydney_offset = FixedOffset::east(10 * 60 * 60);
+///
+/// assert_eq!(arr.value_as_datetime_with_tz(0, sydney_offset).map(|v| v.to_string()).unwrap(), "1970-05-10 00:25:11")
+/// ```
+///
 pub type TimestampSecondArray = PrimitiveArray<TimestampSecondType>;
+/// A primitive array where each element is of type `TimestampMillisecondType.`
+/// See examples for [`TimestampSecondArray.`](crate::array::TimestampSecondArray)
 pub type TimestampMillisecondArray = PrimitiveArray<TimestampMillisecondType>;
+/// A primitive array where each element is of type `TimestampMicrosecondType.`
+/// See examples for [`TimestampSecondArray.`](crate::array::TimestampSecondArray)
 pub type TimestampMicrosecondArray = PrimitiveArray<TimestampMicrosecondType>;
+/// A primitive array where each element is of type `TimestampNanosecondType.`
+/// See examples for [`TimestampSecondArray.`](crate::array::TimestampSecondArray)
 pub type TimestampNanosecondArray = PrimitiveArray<TimestampNanosecondType>;
 pub type Date32Array = PrimitiveArray<Date32Type>;
 pub type Date64Array = PrimitiveArray<Date64Type>;
@@ -331,20 +448,20 @@ pub type Time64MicrosecondArray = PrimitiveArray<Time64MicrosecondType>;
 pub type Time64NanosecondArray = PrimitiveArray<Time64NanosecondType>;
 pub type IntervalYearMonthArray = PrimitiveArray<IntervalYearMonthType>;
 pub type IntervalDayTimeArray = PrimitiveArray<IntervalDayTimeType>;
+pub type IntervalMonthDayNanoArray = PrimitiveArray<IntervalMonthDayNanoType>;
 pub type DurationSecondArray = PrimitiveArray<DurationSecondType>;
 pub type DurationMillisecondArray = PrimitiveArray<DurationMillisecondType>;
 pub type DurationMicrosecondArray = PrimitiveArray<DurationMicrosecondType>;
 pub type DurationNanosecondArray = PrimitiveArray<DurationNanosecondType>;
 
-pub use self::array_binary::BinaryOffsetSizeTrait;
 pub use self::array_binary::GenericBinaryArray;
 pub use self::array_list::GenericListArray;
 pub use self::array_list::OffsetSizeTrait;
 pub use self::array_string::GenericStringArray;
-pub use self::array_string::StringOffsetSizeTrait;
 
 // --------------------- Array Builder ---------------------
 
+pub use self::builder::make_builder;
 pub use self::builder::BooleanBufferBuilder;
 pub use self::builder::BufferBuilder;
 
@@ -359,22 +476,38 @@ pub type UInt64BufferBuilder = BufferBuilder<u64>;
 pub type Float32BufferBuilder = BufferBuilder<f32>;
 pub type Float64BufferBuilder = BufferBuilder<f64>;
 
-pub type TimestampSecondBufferBuilder = BufferBuilder<TimestampSecondType>;
-pub type TimestampMillisecondBufferBuilder = BufferBuilder<TimestampMillisecondType>;
-pub type TimestampMicrosecondBufferBuilder = BufferBuilder<TimestampMicrosecondType>;
-pub type TimestampNanosecondBufferBuilder = BufferBuilder<TimestampNanosecondType>;
-pub type Date32BufferBuilder = BufferBuilder<Date32Type>;
-pub type Date64BufferBuilder = BufferBuilder<Date64Type>;
-pub type Time32SecondBufferBuilder = BufferBuilder<Time32SecondType>;
-pub type Time32MillisecondBufferBuilder = BufferBuilder<Time32MillisecondType>;
-pub type Time64MicrosecondBufferBuilder = BufferBuilder<Time64MicrosecondType>;
-pub type Time64NanosecondBufferBuilder = BufferBuilder<Time64NanosecondType>;
-pub type IntervalYearMonthBufferBuilder = BufferBuilder<IntervalYearMonthType>;
-pub type IntervalDayTimeBufferBuilder = BufferBuilder<IntervalDayTimeType>;
-pub type DurationSecondBufferBuilder = BufferBuilder<DurationSecondType>;
-pub type DurationMillisecondBufferBuilder = BufferBuilder<DurationMillisecondType>;
-pub type DurationMicrosecondBufferBuilder = BufferBuilder<DurationMicrosecondType>;
-pub type DurationNanosecondBufferBuilder = BufferBuilder<DurationNanosecondType>;
+pub type TimestampSecondBufferBuilder =
+    BufferBuilder<<TimestampSecondType as ArrowPrimitiveType>::Native>;
+pub type TimestampMillisecondBufferBuilder =
+    BufferBuilder<<TimestampMillisecondType as ArrowPrimitiveType>::Native>;
+pub type TimestampMicrosecondBufferBuilder =
+    BufferBuilder<<TimestampMicrosecondType as ArrowPrimitiveType>::Native>;
+pub type TimestampNanosecondBufferBuilder =
+    BufferBuilder<<TimestampNanosecondType as ArrowPrimitiveType>::Native>;
+pub type Date32BufferBuilder = BufferBuilder<<Date32Type as ArrowPrimitiveType>::Native>;
+pub type Date64BufferBuilder = BufferBuilder<<Date64Type as ArrowPrimitiveType>::Native>;
+pub type Time32SecondBufferBuilder =
+    BufferBuilder<<Time32SecondType as ArrowPrimitiveType>::Native>;
+pub type Time32MillisecondBufferBuilder =
+    BufferBuilder<<Time32MillisecondType as ArrowPrimitiveType>::Native>;
+pub type Time64MicrosecondBufferBuilder =
+    BufferBuilder<<Time64MicrosecondType as ArrowPrimitiveType>::Native>;
+pub type Time64NanosecondBufferBuilder =
+    BufferBuilder<<Time64NanosecondType as ArrowPrimitiveType>::Native>;
+pub type IntervalYearMonthBufferBuilder =
+    BufferBuilder<<IntervalYearMonthType as ArrowPrimitiveType>::Native>;
+pub type IntervalDayTimeBufferBuilder =
+    BufferBuilder<<IntervalDayTimeType as ArrowPrimitiveType>::Native>;
+pub type IntervalMonthDayNanoBufferBuilder =
+    BufferBuilder<<IntervalMonthDayNanoType as ArrowPrimitiveType>::Native>;
+pub type DurationSecondBufferBuilder =
+    BufferBuilder<<DurationSecondType as ArrowPrimitiveType>::Native>;
+pub type DurationMillisecondBufferBuilder =
+    BufferBuilder<<DurationMillisecondType as ArrowPrimitiveType>::Native>;
+pub type DurationMicrosecondBufferBuilder =
+    BufferBuilder<<DurationMicrosecondType as ArrowPrimitiveType>::Native>;
+pub type DurationNanosecondBufferBuilder =
+    BufferBuilder<<DurationNanosecondType as ArrowPrimitiveType>::Native>;
 
 pub use self::builder::ArrayBuilder;
 pub use self::builder::BinaryBuilder;
@@ -382,11 +515,13 @@ pub use self::builder::BooleanBuilder;
 pub use self::builder::DecimalBuilder;
 pub use self::builder::FixedSizeBinaryBuilder;
 pub use self::builder::FixedSizeListBuilder;
+pub use self::builder::GenericListBuilder;
 pub use self::builder::GenericStringBuilder;
 pub use self::builder::LargeBinaryBuilder;
 pub use self::builder::LargeListBuilder;
 pub use self::builder::LargeStringBuilder;
 pub use self::builder::ListBuilder;
+pub use self::builder::MapBuilder;
 pub use self::builder::PrimitiveBuilder;
 pub use self::builder::PrimitiveDictionaryBuilder;
 pub use self::builder::StringBuilder;
@@ -417,6 +552,7 @@ pub type Time64MicrosecondBuilder = PrimitiveBuilder<Time64MicrosecondType>;
 pub type Time64NanosecondBuilder = PrimitiveBuilder<Time64NanosecondType>;
 pub type IntervalYearMonthBuilder = PrimitiveBuilder<IntervalYearMonthType>;
 pub type IntervalDayTimeBuilder = PrimitiveBuilder<IntervalDayTimeType>;
+pub type IntervalMonthDayNanoBuilder = PrimitiveBuilder<IntervalMonthDayNanoType>;
 pub type DurationSecondBuilder = PrimitiveBuilder<DurationSecondType>;
 pub type DurationMillisecondBuilder = PrimitiveBuilder<DurationMillisecondType>;
 pub type DurationMicrosecondBuilder = PrimitiveBuilder<DurationMicrosecondType>;
@@ -439,11 +575,46 @@ pub use self::ord::{build_compare, DynComparator};
 // --------------------- Array downcast helper functions ---------------------
 
 pub use self::cast::{
-    as_boolean_array, as_dictionary_array, as_generic_binary_array,
+    as_boolean_array, as_decimal_array, as_dictionary_array, as_generic_binary_array,
     as_generic_list_array, as_large_list_array, as_largestring_array, as_list_array,
-    as_null_array, as_primitive_array, as_string_array, as_struct_array,
+    as_map_array, as_null_array, as_primitive_array, as_string_array, as_struct_array,
+    as_union_array,
 };
 
 // ------------------------------ C Data Interface ---------------------------
 
-pub use self::array::make_array_from_raw;
+pub use self::array::{export_array_into_raw, make_array_from_raw};
+
+#[cfg(test)]
+mod tests {
+    use crate::array::*;
+
+    #[test]
+    fn test_buffer_builder_availability() {
+        let _builder = Int8BufferBuilder::new(10);
+        let _builder = Int16BufferBuilder::new(10);
+        let _builder = Int32BufferBuilder::new(10);
+        let _builder = Int64BufferBuilder::new(10);
+        let _builder = UInt16BufferBuilder::new(10);
+        let _builder = UInt32BufferBuilder::new(10);
+        let _builder = Float32BufferBuilder::new(10);
+        let _builder = Float64BufferBuilder::new(10);
+        let _builder = TimestampSecondBufferBuilder::new(10);
+        let _builder = TimestampMillisecondBufferBuilder::new(10);
+        let _builder = TimestampMicrosecondBufferBuilder::new(10);
+        let _builder = TimestampNanosecondBufferBuilder::new(10);
+        let _builder = Date32BufferBuilder::new(10);
+        let _builder = Date64BufferBuilder::new(10);
+        let _builder = Time32SecondBufferBuilder::new(10);
+        let _builder = Time32MillisecondBufferBuilder::new(10);
+        let _builder = Time64MicrosecondBufferBuilder::new(10);
+        let _builder = Time64NanosecondBufferBuilder::new(10);
+        let _builder = IntervalYearMonthBufferBuilder::new(10);
+        let _builder = IntervalDayTimeBufferBuilder::new(10);
+        let _builder = IntervalMonthDayNanoBufferBuilder::new(10);
+        let _builder = DurationSecondBufferBuilder::new(10);
+        let _builder = DurationMillisecondBufferBuilder::new(10);
+        let _builder = DurationMicrosecondBufferBuilder::new(10);
+        let _builder = DurationNanosecondBufferBuilder::new(10);
+    }
+}

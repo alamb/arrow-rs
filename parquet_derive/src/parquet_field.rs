@@ -147,7 +147,7 @@ impl Field {
         // this expression just switches between non-nullable and nullable write statements
         let write_batch_expr = if definition_levels.is_some() {
             quote! {
-                if let #column_writer(ref mut typed) = column_writer {
+                if let #column_writer(ref mut typed) = column_writer.untyped() {
                     typed.write_batch(&vals[..], Some(&definition_levels[..]), None)?;
                 } else {
                     panic!("Schema and struct disagree on type for {}", stringify!{#ident})
@@ -155,7 +155,7 @@ impl Field {
             }
         } else {
             quote! {
-                if let #column_writer(ref mut typed) = column_writer {
+                if let #column_writer(ref mut typed) = column_writer.untyped() {
                     typed.write_batch(&vals[..], None, None)?;
                 } else {
                     panic!("Schema and struct disagree on type for {}", stringify!{#ident})
@@ -507,48 +507,48 @@ impl Type {
 
         match last_part.trim() {
             "bool" => quote! { None },
-            "u8" => quote! { Some(LogicalType::INTEGER(IntType {
+            "u8" => quote! { Some(LogicalType::Integer {
                 bit_width: 8,
                 is_signed: false,
-            })) },
-            "u16" => quote! { Some(LogicalType::INTEGER(IntType {
+            }) },
+            "u16" => quote! { Some(LogicalType::Integer {
                 bit_width: 16,
                 is_signed: false,
-            })) },
-            "u32" => quote! { Some(LogicalType::INTEGER(IntType {
+            }) },
+            "u32" => quote! { Some(LogicalType::Integer {
                 bit_width: 32,
                 is_signed: false,
-            })) },
-            "u64" => quote! { Some(LogicalType::INTEGER(IntType {
+            }) },
+            "u64" => quote! { Some(LogicalType::Integer {
                 bit_width: 64,
                 is_signed: false,
-            })) },
-            "i8" => quote! { Some(LogicalType::INTEGER(IntType {
+            }) },
+            "i8" => quote! { Some(LogicalType::Integer {
                 bit_width: 8,
                 is_signed: true,
-            })) },
-            "i16" => quote! { Some(LogicalType::INTEGER(IntType {
+            }) },
+            "i16" => quote! { Some(LogicalType::Integer {
                 bit_width: 16,
                 is_signed: true,
-            })) },
+            }) },
             "i32" | "i64" => quote! { None },
             "usize" => {
-                quote! { Some(LogicalType::INTEGER(IntType {
+                quote! { Some(LogicalType::Integer {
                     bit_width: usize::BITS as i8,
                     is_signed: false
-                })) }
+                }) }
             }
             "isize" => {
-                quote! { Some(LogicalType::INTEGER(IntType {
+                quote! { Some(LogicalType::Integer {
                     bit_width: usize::BITS as i8,
                     is_signed: true
-                })) }
+                }) }
             }
-            "NaiveDate" => quote! { Some(LogicalType::DATE(Default::default())) },
+            "NaiveDate" => quote! { Some(LogicalType::Date) },
             "NaiveDateTime" => quote! { None },
             "f32" | "f64" => quote! { None },
-            "String" | "str" => quote! { Some(LogicalType::STRING(Default::default())) },
-            "Uuid" => quote! { Some(LogicalType::UUID(Default::default())) },
+            "String" | "str" => quote! { Some(LogicalType::String) },
+            "Uuid" => quote! { Some(LogicalType::Uuid) },
             f => unimplemented!("{} currently is not supported", f),
         }
     }
@@ -666,7 +666,7 @@ mod test {
                         {
                             let vals : Vec < _ > = records . iter ( ) . map ( | rec | rec . counter as i64 ) . collect ( );
 
-                            if let parquet::column::writer::ColumnWriter::Int64ColumnWriter ( ref mut typed ) = column_writer {
+                            if let parquet::column::writer::ColumnWriter::Int64ColumnWriter ( ref mut typed ) = column_writer.untyped() {
                                 typed . write_batch ( & vals [ .. ] , None , None ) ?;
                             }  else {
                                 panic!("Schema and struct disagree on type for {}" , stringify!{ counter } )
@@ -703,7 +703,7 @@ mod test {
                     }
                 }).collect();
 
-                if let parquet::column::writer::ColumnWriter::ByteArrayColumnWriter ( ref mut typed ) = column_writer {
+                if let parquet::column::writer::ColumnWriter::ByteArrayColumnWriter ( ref mut typed ) = column_writer.untyped() {
                     typed . write_batch ( & vals [ .. ] , Some(&definition_levels[..]) , None ) ? ;
                 } else {
                     panic!("Schema and struct disagree on type for {}" , stringify ! { optional_str } )
@@ -727,7 +727,7 @@ mod test {
                             }
                         }).collect();
 
-                        if let parquet::column::writer::ColumnWriter::ByteArrayColumnWriter ( ref mut typed ) = column_writer {
+                        if let parquet::column::writer::ColumnWriter::ByteArrayColumnWriter ( ref mut typed ) = column_writer.untyped() {
                             typed . write_batch ( & vals [ .. ] , Some(&definition_levels[..]) , None ) ? ;
                         } else {
                             panic!("Schema and struct disagree on type for {}" , stringify ! { optional_string } )
@@ -750,7 +750,7 @@ mod test {
                             }
                         }).collect();
 
-                        if let parquet::column::writer::ColumnWriter::Int32ColumnWriter ( ref mut typed ) = column_writer {
+                        if let parquet::column::writer::ColumnWriter::Int32ColumnWriter ( ref mut typed ) = column_writer.untyped() {
                             typed . write_batch ( & vals [ .. ] , Some(&definition_levels[..]) , None ) ? ;
                         }  else {
                             panic!("Schema and struct disagree on type for {}" , stringify ! { optional_dumb_int } )
@@ -769,7 +769,7 @@ mod test {
         };
 
         let fields = extract_fields(snippet);
-        let processed: Vec<_> = fields.iter().map(|field| Field::from(field)).collect();
+        let processed: Vec<_> = fields.iter().map(Field::from).collect();
 
         let column_writers: Vec<_> = processed
             .iter()
@@ -800,7 +800,7 @@ mod test {
         };
 
         let fields = extract_fields(snippet);
-        let processed: Vec<_> = fields.iter().map(|field| Field::from(field)).collect();
+        let processed: Vec<_> = fields.iter().map(Field::from).collect();
         assert_eq!(processed.len(), 3);
 
         assert_eq!(
@@ -840,8 +840,7 @@ mod test {
         };
 
         let fields = extract_fields(snippet);
-        let converted_fields: Vec<_> =
-            fields.iter().map(|field| Type::from(field)).collect();
+        let converted_fields: Vec<_> = fields.iter().map(Type::from).collect();
         let inner_types: Vec<_> = converted_fields
             .iter()
             .map(|field| field.inner_type())
@@ -878,8 +877,7 @@ mod test {
         };
 
         let fields = extract_fields(snippet);
-        let converted_fields: Vec<_> =
-            fields.iter().map(|field| Type::from(field)).collect();
+        let converted_fields: Vec<_> = fields.iter().map(Type::from).collect();
         let physical_types: Vec<_> = converted_fields
             .iter()
             .map(|ty| ty.physical_type())
@@ -911,8 +909,7 @@ mod test {
         };
 
         let fields = extract_fields(snippet);
-        let converted_fields: Vec<_> =
-            fields.iter().map(|field| Type::from(field)).collect();
+        let converted_fields: Vec<_> = fields.iter().map(Type::from).collect();
 
         assert_eq!(
             converted_fields,
@@ -938,7 +935,7 @@ mod test {
         };
 
         let fields = extract_fields(snippet);
-        let types: Vec<_> = fields.iter().map(|field| Type::from(field)).collect();
+        let types: Vec<_> = fields.iter().map(Type::from).collect();
 
         assert_eq!(
             types,
@@ -978,7 +975,7 @@ mod test {
         assert_eq!(when.writer_snippet().to_string(),(quote!{
             {
                 let vals : Vec<_> = records.iter().map(|rec| rec.henceforth.timestamp_millis() ).collect();
-                if let parquet::column::writer::ColumnWriter::Int64ColumnWriter(ref mut typed) = column_writer {
+                if let parquet::column::writer::ColumnWriter::Int64ColumnWriter(ref mut typed) = column_writer.untyped() {
                     typed.write_batch(&vals[..], None, None) ?;
                 } else {
                     panic!("Schema and struct disagree on type for {}" , stringify!{ henceforth })
@@ -998,7 +995,7 @@ mod test {
                     }
                 }).collect();
 
-                if let parquet::column::writer::ColumnWriter::Int64ColumnWriter(ref mut typed) = column_writer {
+                if let parquet::column::writer::ColumnWriter::Int64ColumnWriter(ref mut typed) = column_writer.untyped() {
                     typed.write_batch(&vals[..], Some(&definition_levels[..]), None) ?;
                 } else {
                     panic!("Schema and struct disagree on type for {}" , stringify!{ maybe_happened })
@@ -1021,7 +1018,7 @@ mod test {
         assert_eq!(when.writer_snippet().to_string(),(quote!{
             {
                 let vals : Vec<_> = records.iter().map(|rec| rec.henceforth.signed_duration_since(chrono::NaiveDate::from_ymd(1970, 1, 1)).num_days() as i32).collect();
-                if let parquet::column::writer::ColumnWriter::Int32ColumnWriter(ref mut typed) = column_writer {
+                if let parquet::column::writer::ColumnWriter::Int32ColumnWriter(ref mut typed) = column_writer.untyped() {
                     typed.write_batch(&vals[..], None, None) ?;
                 } else {
                     panic!("Schema and struct disagree on type for {}" , stringify!{ henceforth })
@@ -1041,7 +1038,7 @@ mod test {
                     }
                 }).collect();
 
-                if let parquet::column::writer::ColumnWriter::Int32ColumnWriter(ref mut typed) = column_writer {
+                if let parquet::column::writer::ColumnWriter::Int32ColumnWriter(ref mut typed) = column_writer.untyped() {
                     typed.write_batch(&vals[..], Some(&definition_levels[..]), None) ?;
                 } else {
                     panic!("Schema and struct disagree on type for {}" , stringify!{ maybe_happened })
@@ -1064,7 +1061,7 @@ mod test {
         assert_eq!(when.writer_snippet().to_string(),(quote!{
             {
                 let vals : Vec<_> = records.iter().map(|rec| (&rec.unique_id.to_string()[..]).into() ).collect();
-                if let parquet::column::writer::ColumnWriter::ByteArrayColumnWriter(ref mut typed) = column_writer {
+                if let parquet::column::writer::ColumnWriter::ByteArrayColumnWriter(ref mut typed) = column_writer.untyped() {
                     typed.write_batch(&vals[..], None, None) ?;
                 } else {
                     panic!("Schema and struct disagree on type for {}" , stringify!{ unique_id })
@@ -1084,7 +1081,7 @@ mod test {
                     }
                 }).collect();
 
-                if let parquet::column::writer::ColumnWriter::ByteArrayColumnWriter(ref mut typed) = column_writer {
+                if let parquet::column::writer::ColumnWriter::ByteArrayColumnWriter(ref mut typed) = column_writer.untyped() {
                     typed.write_batch(&vals[..], Some(&definition_levels[..]), None) ?;
                 } else {
                     panic!("Schema and struct disagree on type for {}" , stringify!{ maybe_unique_id })

@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
+use std::ops::Range;
 use std::sync::Arc;
 
 use crate::array::*;
@@ -32,29 +33,6 @@ use crate::buffer::{Buffer, MutableBuffer};
 use crate::datatypes::*;
 use crate::error::{ArrowError, Result};
 use crate::util::bit_util;
-
-///  Converts a `MutableBuffer` to a `BufferBuilder<T>`.
-///
-/// `slots` is the number of array slots currently represented in the `MutableBuffer`.
-pub(crate) fn mutable_buffer_to_builder<T: ArrowNativeType>(
-    mutable_buffer: MutableBuffer,
-    slots: usize,
-) -> BufferBuilder<T> {
-    BufferBuilder::<T> {
-        buffer: mutable_buffer,
-        len: slots,
-        _marker: PhantomData,
-    }
-}
-
-///  Converts a `BufferBuilder<T>` into its underlying `MutableBuffer`.
-///
-/// `From` is not implemented because associated type bounds are unstable.
-pub(crate) fn builder_to_mutable_buffer<T: ArrowNativeType>(
-    builder: BufferBuilder<T>,
-) -> MutableBuffer {
-    builder.buffer
-}
 
 /// Builder for creating a [`Buffer`](crate::buffer::Buffer) object.
 ///
@@ -75,7 +53,7 @@ pub(crate) fn builder_to_mutable_buffer<T: ArrowNativeType>(
 /// builder.append(45);
 /// let buffer = builder.finish();
 ///
-/// assert_eq!(unsafe { buffer.typed_data::<u8>() }, &[42, 43, 44, 45]);
+/// assert_eq!(buffer.typed_data::<u8>(), &[42, 43, 44, 45]);
 /// # Ok(())
 /// # }
 /// ```
@@ -179,8 +157,7 @@ impl<T: ArrowNativeType> BufferBuilder<T> {
     /// ```
     #[inline]
     pub fn advance(&mut self, i: usize) {
-        let new_buffer_len = (self.len + i) * mem::size_of::<T>();
-        self.buffer.resize(new_buffer_len, 0);
+        self.buffer.extend_zeros(i * mem::size_of::<T>());
         self.len += i;
     }
 
@@ -243,6 +220,24 @@ impl<T: ArrowNativeType> BufferBuilder<T> {
         self.len += n;
     }
 
+    /// Appends `n`, zero-initialized values
+    ///
+    /// # Example:
+    ///
+    /// ```
+    /// use arrow::array::UInt32BufferBuilder;
+    ///
+    /// let mut builder = UInt32BufferBuilder::new(10);
+    /// builder.append_n_zeroed(3);
+    ///
+    /// assert_eq!(builder.len(), 3);
+    /// assert_eq!(builder.as_slice(), &[0, 0, 0])
+    #[inline]
+    pub fn append_n_zeroed(&mut self, n: usize) {
+        self.buffer.extend_zeros(n * mem::size_of::<T>());
+        self.len += n;
+    }
+
     /// Appends a slice of type `T`, growing the internal buffer as needed.
     ///
     /// # Example:
@@ -259,6 +254,78 @@ impl<T: ArrowNativeType> BufferBuilder<T> {
     pub fn append_slice(&mut self, slice: &[T]) {
         self.buffer.extend_from_slice(slice);
         self.len += slice.len();
+    }
+
+    /// View the contents of this buffer as a slice
+    ///
+    /// ```
+    /// use arrow::array::Float64BufferBuilder;
+    ///
+    /// let mut builder = Float64BufferBuilder::new(10);
+    /// builder.append(1.3);
+    /// builder.append_n(2, 2.3);
+    ///
+    /// assert_eq!(builder.as_slice(), &[1.3, 2.3, 2.3]);
+    /// ```
+    #[inline]
+    pub fn as_slice(&self) -> &[T] {
+        // SAFETY
+        //
+        // - MutableBuffer is aligned and initialized for len elements of T
+        // - MutableBuffer corresponds to a single allocation
+        // - MutableBuffer does not support modification whilst active immutable borrows
+        unsafe { std::slice::from_raw_parts(self.buffer.as_ptr() as _, self.len) }
+    }
+
+    /// View the contents of this buffer as a mutable slice
+    ///
+    /// # Example:
+    ///
+    /// ```
+    /// use arrow::array::Float32BufferBuilder;
+    ///
+    /// let mut builder = Float32BufferBuilder::new(10);
+    ///
+    /// builder.append_slice(&[1., 2., 3.4]);
+    /// assert_eq!(builder.as_slice(), &[1., 2., 3.4]);
+    ///
+    /// builder.as_slice_mut()[1] = 4.2;
+    /// assert_eq!(builder.as_slice(), &[1., 4.2, 3.4]);
+    /// ```
+    #[inline]
+    pub fn as_slice_mut(&mut self) -> &mut [T] {
+        // SAFETY
+        //
+        // - MutableBuffer is aligned and initialized for len elements of T
+        // - MutableBuffer corresponds to a single allocation
+        // - MutableBuffer does not support modification whilst active immutable borrows
+        unsafe { std::slice::from_raw_parts_mut(self.buffer.as_mut_ptr() as _, self.len) }
+    }
+
+    /// Shorten this BufferBuilder to `len` items
+    ///
+    /// If `len` is greater than the builder's current length, this has no effect
+    ///
+    /// # Example:
+    ///
+    /// ```
+    /// use arrow::array::UInt16BufferBuilder;
+    ///
+    /// let mut builder = UInt16BufferBuilder::new(10);
+    ///
+    /// builder.append_slice(&[42, 44, 46]);
+    /// assert_eq!(builder.as_slice(), &[42, 44, 46]);
+    ///
+    /// builder.truncate(2);
+    /// assert_eq!(builder.as_slice(), &[42, 44]);
+    ///
+    /// builder.append(12);
+    /// assert_eq!(builder.as_slice(), &[42, 44, 12]);
+    /// ```
+    #[inline]
+    pub fn truncate(&mut self, len: usize) {
+        self.buffer.truncate(len * mem::size_of::<T>());
+        self.len = len;
     }
 
     /// # Safety
@@ -290,7 +357,7 @@ impl<T: ArrowNativeType> BufferBuilder<T> {
     ///
     /// let buffer = builder.finish();
     ///
-    /// assert_eq!(unsafe { buffer.typed_data::<u8>() }, &[42, 44, 46]);
+    /// assert_eq!(buffer.typed_data::<u8>(), &[42, 44, 46]);
     /// ```
     #[inline]
     pub fn finish(&mut self) -> Buffer {
@@ -310,7 +377,7 @@ impl BooleanBufferBuilder {
     #[inline]
     pub fn new(capacity: usize) -> Self {
         let byte_capacity = bit_util::ceil(capacity, 8);
-        let buffer = MutableBuffer::from_len_zeroed(byte_capacity);
+        let buffer = MutableBuffer::new(byte_capacity);
         Self { buffer, len: 0 }
     }
 
@@ -366,6 +433,15 @@ impl BooleanBufferBuilder {
         }
     }
 
+    /// Resizes the buffer, either truncating its contents (with no change in capacity), or
+    /// growing it (potentially reallocating it) and writing `false` in the newly available bits.
+    #[inline]
+    pub fn resize(&mut self, len: usize) {
+        let len_bytes = bit_util::ceil(len, 8);
+        self.buffer.resize(len_bytes, 0);
+        self.len = len;
+    }
+
     #[inline]
     pub fn append(&mut self, v: bool) {
         self.advance(1);
@@ -396,6 +472,31 @@ impl BooleanBufferBuilder {
                 unsafe { bit_util::set_bit_raw(self.buffer.as_mut_ptr(), offset + i) }
             }
         }
+    }
+
+    /// Append `range` bits from `to_set`
+    ///
+    /// `to_set` is a slice of bits packed LSB-first into `[u8]`
+    ///
+    /// # Panics
+    ///
+    /// Panics if `to_set` does not contain `ceil(range.end / 8)` bytes
+    pub fn append_packed_range(&mut self, range: Range<usize>, to_set: &[u8]) {
+        let offset_write = self.len;
+        let len = range.end - range.start;
+        self.advance(len);
+        crate::util::bit_mask::set_bits(
+            self.buffer.as_slice_mut(),
+            to_set,
+            offset_write,
+            range.start,
+            len,
+        );
+    }
+
+    /// Returns the packed bits
+    pub fn as_slice(&self) -> &[u8] {
+        self.buffer.as_slice()
     }
 
     #[inline]
@@ -595,12 +696,11 @@ impl BooleanBuilder {
         let len = self.len();
         let null_bit_buffer = self.bitmap_builder.finish();
         let null_count = len - null_bit_buffer.count_set_bits();
-        let mut builder = ArrayData::builder(DataType::Boolean)
+        let builder = ArrayData::builder(DataType::Boolean)
             .len(len)
-            .add_buffer(self.values_builder.finish());
-        if null_count > 0 {
-            builder = builder.null_bit_buffer(null_bit_buffer);
-        }
+            .add_buffer(self.values_builder.finish())
+            .null_bit_buffer((null_count > 0).then(|| null_bit_buffer));
+
         let array_data = unsafe { builder.build_unchecked() };
         BooleanArray::from(array_data)
     }
@@ -794,12 +894,15 @@ impl<T: ArrowPrimitiveType> PrimitiveBuilder<T> {
                 .as_ref()
                 .map(|b| b.count_set_bits())
                 .unwrap_or(len);
-        let mut builder = ArrayData::builder(T::DATA_TYPE)
+        let builder = ArrayData::builder(T::DATA_TYPE)
             .len(len)
-            .add_buffer(self.values_builder.finish());
-        if null_count > 0 {
-            builder = builder.null_bit_buffer(null_bit_buffer.unwrap());
-        }
+            .add_buffer(self.values_builder.finish())
+            .null_bit_buffer(if null_count > 0 {
+                null_bit_buffer
+            } else {
+                None
+            });
+
         let array_data = unsafe { builder.build_unchecked() };
         PrimitiveArray::<T>::from(array_data)
     }
@@ -821,7 +924,7 @@ impl<T: ArrowPrimitiveType> PrimitiveBuilder<T> {
             .len(len)
             .add_buffer(self.values_builder.finish());
         if null_count > 0 {
-            builder = builder.null_bit_buffer(null_bit_buffer.unwrap());
+            builder = builder.null_bit_buffer(null_bit_buffer);
         }
         builder = builder.add_child_data(values.data().clone());
         let array_data = unsafe { builder.build_unchecked() };
@@ -948,7 +1051,7 @@ where
             values_data.data_type().clone(),
             true, // TODO: find a consistent way of getting this
         ));
-        let data_type = if OffsetSize::is_large() {
+        let data_type = if OffsetSize::IS_LARGE {
             DataType::LargeList(field)
         } else {
             DataType::List(field)
@@ -957,7 +1060,7 @@ where
             .len(len)
             .add_buffer(offset_buffer)
             .add_child_data(values_data.clone())
-            .null_bit_buffer(null_bit_buffer);
+            .null_bit_buffer(Some(null_bit_buffer));
 
         let array_data = unsafe { array_data.build_unchecked() };
 
@@ -1088,7 +1191,7 @@ where
         ))
         .len(len)
         .add_child_data(values_data.clone())
-        .null_bit_buffer(null_bit_buffer);
+        .null_bit_buffer(Some(null_bit_buffer));
 
         let array_data = unsafe { array_data.build_unchecked() };
 
@@ -1128,11 +1231,13 @@ pub struct DecimalBuilder {
     builder: FixedSizeListBuilder<UInt8Builder>,
     precision: usize,
     scale: usize,
+
+    /// Should i128 values be validated for compatibility with scale and precision?
+    /// defaults to true
+    value_validation: bool,
 }
 
-impl<OffsetSize: BinaryOffsetSizeTrait> ArrayBuilder
-    for GenericBinaryBuilder<OffsetSize>
-{
+impl<OffsetSize: OffsetSizeTrait> ArrayBuilder for GenericBinaryBuilder<OffsetSize> {
     /// Returns the builder as a non-mutable `Any` reference.
     fn as_any(&self) -> &dyn Any {
         self
@@ -1164,9 +1269,7 @@ impl<OffsetSize: BinaryOffsetSizeTrait> ArrayBuilder
     }
 }
 
-impl<OffsetSize: StringOffsetSizeTrait> ArrayBuilder
-    for GenericStringBuilder<OffsetSize>
-{
+impl<OffsetSize: OffsetSizeTrait> ArrayBuilder for GenericStringBuilder<OffsetSize> {
     /// Returns the builder as a non-mutable `Any` reference.
     fn as_any(&self) -> &dyn Any {
         self
@@ -1263,7 +1366,7 @@ impl ArrayBuilder for DecimalBuilder {
     }
 }
 
-impl<OffsetSize: BinaryOffsetSizeTrait> GenericBinaryBuilder<OffsetSize> {
+impl<OffsetSize: OffsetSizeTrait> GenericBinaryBuilder<OffsetSize> {
     /// Creates a new `GenericBinaryBuilder`, `capacity` is the number of bytes in the values
     /// array
     pub fn new(capacity: usize) -> Self {
@@ -1312,7 +1415,7 @@ impl<OffsetSize: BinaryOffsetSizeTrait> GenericBinaryBuilder<OffsetSize> {
     }
 }
 
-impl<OffsetSize: StringOffsetSizeTrait> GenericStringBuilder<OffsetSize> {
+impl<OffsetSize: OffsetSizeTrait> GenericStringBuilder<OffsetSize> {
     /// Creates a new `StringBuilder`,
     /// `capacity` is the number of bytes of string data to pre-allocate space for in this builder
     pub fn new(capacity: usize) -> Self {
@@ -1422,7 +1525,18 @@ impl DecimalBuilder {
             builder: FixedSizeListBuilder::new(values_builder, byte_width),
             precision,
             scale,
+            value_validation: true,
         }
+    }
+
+    /// Disable validation
+    ///
+    /// # Safety
+    ///
+    /// After disabling validation, caller must ensure that appended values are compatible
+    /// for the specified precision and scale.
+    pub unsafe fn disable_value_validation(&mut self) {
+        self.value_validation = false;
     }
 
     /// Appends a byte slice into the builder.
@@ -1430,7 +1544,13 @@ impl DecimalBuilder {
     /// Automatically calls the `append` method to delimit the slice appended in as a
     /// distinct array element.
     #[inline]
-    pub fn append_value(&mut self, value: i128) -> Result<()> {
+    pub fn append_value(&mut self, value: impl Into<i128>) -> Result<()> {
+        let value = if self.value_validation {
+            validate_decimal_precision(value.into(), self.precision)?
+        } else {
+            value.into()
+        };
+
         let value_as_bytes = Self::from_i128_to_fixed_size_bytes(
             value,
             self.builder.value_length() as usize,
@@ -1446,7 +1566,7 @@ impl DecimalBuilder {
         self.builder.append(true)
     }
 
-    fn from_i128_to_fixed_size_bytes(v: i128, size: usize) -> Result<Vec<u8>> {
+    pub(crate) fn from_i128_to_fixed_size_bytes(v: i128, size: usize) -> Result<Vec<u8>> {
         if size > 16 {
             return Err(ArrowError::InvalidArgumentError(
                 "DecimalBuilder only supports values up to 16 bytes.".to_string(),
@@ -1597,6 +1717,9 @@ pub fn make_builder(datatype: &DataType, capacity: usize) -> Box<dyn ArrayBuilde
         DataType::Interval(IntervalUnit::DayTime) => {
             Box::new(IntervalDayTimeBuilder::new(capacity))
         }
+        DataType::Interval(IntervalUnit::MonthDayNano) => {
+            Box::new(IntervalMonthDayNanoBuilder::new(capacity))
+        }
         DataType::Duration(TimeUnit::Second) => {
             Box::new(DurationSecondBuilder::new(capacity))
         }
@@ -1675,7 +1798,7 @@ impl StructBuilder {
             .len(self.len)
             .child_data(child_data);
         if null_count > 0 {
-            builder = builder.null_bit_buffer(null_bit_buffer);
+            builder = builder.null_bit_buffer(Some(null_bit_buffer));
         }
 
         self.len = 0;
@@ -1712,6 +1835,7 @@ impl Default for MapFieldNames {
     }
 }
 
+#[allow(dead_code)]
 impl<K: ArrayBuilder, V: ArrayBuilder> MapBuilder<K, V> {
     pub fn new(
         field_names: Option<MapFieldNames>,
@@ -1809,7 +1933,7 @@ impl<K: ArrayBuilder, V: ArrayBuilder> MapBuilder<K, V> {
             .len(len)
             .add_buffer(offset_buffer)
             .add_child_data(struct_array.data().clone())
-            .null_bit_buffer(null_bit_buffer);
+            .null_bit_buffer(Some(null_bit_buffer));
 
         let array_data = unsafe { array_data.build_unchecked() };
 
@@ -1851,106 +1975,65 @@ struct FieldData {
     /// The Arrow data type represented in the `values_buffer`, which is untyped
     data_type: DataType,
     /// A buffer containing the values for this field in raw bytes
-    values_buffer: Option<MutableBuffer>,
+    values_buffer: Box<dyn FieldDataValues>,
     ///  The number of array slots represented by the buffer
     slots: usize,
-    /// A builder for the bitmap if required (for Sparse Unions)
-    bitmap_builder: Option<BooleanBufferBuilder>,
+    /// A builder for the null bitmap
+    bitmap_builder: BooleanBufferBuilder,
+}
+
+/// A type-erased [`BufferBuilder`] used by [`FieldData`]
+trait FieldDataValues: std::fmt::Debug {
+    fn as_mut_any(&mut self) -> &mut dyn Any;
+
+    fn append_null(&mut self);
+
+    fn finish(&mut self) -> Buffer;
+}
+
+impl<T: ArrowNativeType> FieldDataValues for BufferBuilder<T> {
+    fn as_mut_any(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn append_null(&mut self) {
+        self.advance(1)
+    }
+
+    fn finish(&mut self) -> Buffer {
+        self.finish()
+    }
 }
 
 impl FieldData {
     /// Creates a new `FieldData`.
-    fn new(
-        type_id: i8,
-        data_type: DataType,
-        bitmap_builder: Option<BooleanBufferBuilder>,
-    ) -> Self {
+    fn new<T: ArrowPrimitiveType>(type_id: i8, data_type: DataType) -> Self {
         Self {
             type_id,
             data_type,
-            values_buffer: Some(MutableBuffer::new(1)),
             slots: 0,
-            bitmap_builder,
+            values_buffer: Box::new(BufferBuilder::<T::Native>::new(1)),
+            bitmap_builder: BooleanBufferBuilder::new(1),
         }
     }
 
     /// Appends a single value to this `FieldData`'s `values_buffer`.
-    #[allow(clippy::unnecessary_wraps)]
-    fn append_to_values_buffer<T: ArrowPrimitiveType>(
-        &mut self,
-        v: T::Native,
-    ) -> Result<()> {
-        let values_buffer = self
-            .values_buffer
-            .take()
-            .expect("Values buffer was never created");
-        let mut builder: BufferBuilder<T::Native> =
-            mutable_buffer_to_builder(values_buffer, self.slots);
-        builder.append(v);
-        let mutable_buffer = builder_to_mutable_buffer(builder);
-        self.values_buffer = Some(mutable_buffer);
+    fn append_value<T: ArrowPrimitiveType>(&mut self, v: T::Native) {
+        self.values_buffer
+            .as_mut_any()
+            .downcast_mut::<BufferBuilder<T::Native>>()
+            .expect("Tried to append unexpected type")
+            .append(v);
 
+        self.bitmap_builder.append(true);
         self.slots += 1;
-        if let Some(b) = &mut self.bitmap_builder {
-            b.append(true)
-        };
-        Ok(())
     }
 
     /// Appends a null to this `FieldData`.
-    #[allow(clippy::unnecessary_wraps)]
-    fn append_null<T: ArrowPrimitiveType>(&mut self) -> Result<()> {
-        if let Some(b) = &mut self.bitmap_builder {
-            let values_buffer = self
-                .values_buffer
-                .take()
-                .expect("Values buffer was never created");
-            let mut builder: BufferBuilder<T::Native> =
-                mutable_buffer_to_builder(values_buffer, self.slots);
-            builder.advance(1);
-            let mutable_buffer = builder_to_mutable_buffer(builder);
-            self.values_buffer = Some(mutable_buffer);
-            self.slots += 1;
-            b.append(false);
-        };
-        Ok(())
-    }
-
-    /// Appends a null to this `FieldData` when the type is not known at compile time.
-    ///
-    /// As the main `append` method of `UnionBuilder` is generic, we need a way to append null
-    /// slots to the fields that are not being appended to in the case of sparse unions.  This
-    /// method solves this problem by appending dynamically based on `DataType`.
-    ///
-    /// Note, this method does **not** update the length of the `UnionArray` (this is done by the
-    /// main append operation) and assumes that it is called from a method that is generic over `T`
-    /// where `T` satisfies the bound `ArrowPrimitiveType`.
-    fn append_null_dynamic(&mut self) -> Result<()> {
-        match self.data_type {
-            DataType::Null => unimplemented!(),
-            DataType::Int8 => self.append_null::<Int8Type>()?,
-            DataType::Int16 => self.append_null::<Int16Type>()?,
-            DataType::Int32
-            | DataType::Date32
-            | DataType::Time32(_)
-            | DataType::Interval(IntervalUnit::YearMonth) => {
-                self.append_null::<Int32Type>()?
-            }
-            DataType::Int64
-            | DataType::Timestamp(_, _)
-            | DataType::Date64
-            | DataType::Time64(_)
-            | DataType::Interval(IntervalUnit::DayTime)
-            | DataType::Duration(_) => self.append_null::<Int64Type>()?,
-            DataType::UInt8 => self.append_null::<UInt8Type>()?,
-            DataType::UInt16 => self.append_null::<UInt16Type>()?,
-            DataType::UInt32 => self.append_null::<UInt32Type>()?,
-            DataType::UInt64 => self.append_null::<UInt64Type>()?,
-            DataType::Float32 => self.append_null::<Float32Type>()?,
-            DataType::Float64 => self.append_null::<Float64Type>()?,
-            _ => unreachable!("All cases of types that satisfy the trait bounds over T are covered above."),
-        };
-        Ok(())
+    fn append_null(&mut self) {
+        self.values_buffer.append_null();
+        self.bitmap_builder.append(false);
+        self.slots += 1;
     }
 }
 
@@ -2006,8 +2089,6 @@ pub struct UnionBuilder {
     type_id_builder: Int8BufferBuilder,
     /// Builder to keep track of offsets (`None` for sparse unions)
     value_offset_builder: Option<Int32BufferBuilder>,
-    /// Optional builder for null slots
-    bitmap_builder: Option<BooleanBufferBuilder>,
 }
 
 impl UnionBuilder {
@@ -2018,7 +2099,6 @@ impl UnionBuilder {
             fields: HashMap::default(),
             type_id_builder: Int8BufferBuilder::new(capacity),
             value_offset_builder: Some(Int32BufferBuilder::new(capacity)),
-            bitmap_builder: None,
         }
     }
 
@@ -2029,35 +2109,19 @@ impl UnionBuilder {
             fields: HashMap::default(),
             type_id_builder: Int8BufferBuilder::new(capacity),
             value_offset_builder: None,
-            bitmap_builder: None,
         }
     }
 
-    /// Appends a null to this builder.
+    /// Appends a null to this builder, encoding the null in the array
+    /// of the `type_name` child / field.
+    ///
+    /// Since `UnionArray` encodes nulls as an entry in its children
+    /// (it doesn't have a validity bitmap itself), and where the null
+    /// is part of the final array, appending a NULL requires
+    /// specifying which field (child) to use.
     #[inline]
-    pub fn append_null(&mut self) -> Result<()> {
-        if self.bitmap_builder.is_none() {
-            let mut builder = BooleanBufferBuilder::new(self.len + 1);
-            for _ in 0..self.len {
-                builder.append(true);
-            }
-            self.bitmap_builder = Some(builder)
-        }
-        self.bitmap_builder
-            .as_mut()
-            .expect("Cannot be None")
-            .append(false);
-
-        self.type_id_builder.append(i8::default());
-
-        // Handle sparse union
-        if self.value_offset_builder.is_none() {
-            for (_, fd) in self.fields.iter_mut() {
-                fd.append_null_dynamic()?;
-            }
-        }
-        self.len += 1;
-        Ok(())
+    pub fn append_null<T: ArrowPrimitiveType>(&mut self, type_name: &str) -> Result<()> {
+        self.append_option::<T>(type_name, None)
     }
 
     /// Appends a value to this builder.
@@ -2067,20 +2131,30 @@ impl UnionBuilder {
         type_name: &str,
         v: T::Native,
     ) -> Result<()> {
+        self.append_option::<T>(type_name, Some(v))
+    }
+
+    fn append_option<T: ArrowPrimitiveType>(
+        &mut self,
+        type_name: &str,
+        v: Option<T::Native>,
+    ) -> Result<()> {
         let type_name = type_name.to_string();
 
         let mut field_data = match self.fields.remove(&type_name) {
-            Some(data) => data,
+            Some(data) => {
+                if data.data_type != T::DATA_TYPE {
+                    return Err(ArrowError::InvalidArgumentError(format!("Attempt to write col \"{}\" with type {} doesn't match existing type {}", type_name, T::DATA_TYPE, data.data_type)));
+                }
+                data
+            }
             None => match self.value_offset_builder {
-                Some(_) => FieldData::new(self.fields.len() as i8, T::DATA_TYPE, None),
+                Some(_) => FieldData::new::<T>(self.fields.len() as i8, T::DATA_TYPE),
                 None => {
-                    let mut fd = FieldData::new(
-                        self.fields.len() as i8,
-                        T::DATA_TYPE,
-                        Some(BooleanBufferBuilder::new(1)),
-                    );
+                    let mut fd =
+                        FieldData::new::<T>(self.fields.len() as i8, T::DATA_TYPE);
                     for _ in 0..self.len {
-                        fd.append_null::<T>()?;
+                        fd.append_null();
                     }
                     fd
                 }
@@ -2095,20 +2169,19 @@ impl UnionBuilder {
             }
             // Sparse Union
             None => {
-                for (name, fd) in self.fields.iter_mut() {
-                    if name != &type_name {
-                        fd.append_null_dynamic()?;
-                    }
+                for (_, fd) in self.fields.iter_mut() {
+                    // Append to all bar the FieldData currently being appended to
+                    fd.append_null();
                 }
             }
         }
-        field_data.append_to_values_buffer::<T>(v)?;
-        self.fields.insert(type_name, field_data);
 
-        // Update the bitmap builder if it exists
-        if let Some(b) = &mut self.bitmap_builder {
-            b.append(true);
+        match v {
+            Some(v) => field_data.append_value::<T>(v),
+            None => field_data.append_null(),
         }
+
+        self.fields.insert(type_name, field_data);
         self.len += 1;
         Ok(())
     }
@@ -2123,27 +2196,19 @@ impl UnionBuilder {
             FieldData {
                 type_id,
                 data_type,
-                values_buffer,
+                mut values_buffer,
                 slots,
-                bitmap_builder,
+                mut bitmap_builder,
             },
         ) in self.fields.into_iter()
         {
-            let buffer = values_buffer
-                .expect("The `values_buffer` should only ever be None inside the `append` method.")
-                .into();
+            let buffer = values_buffer.finish();
             let arr_data_builder = ArrayDataBuilder::new(data_type.clone())
                 .add_buffer(buffer)
-                .len(slots);
-            //                .build();
-            let arr_data_ref = unsafe {
-                match bitmap_builder {
-                    Some(mut bb) => arr_data_builder
-                        .null_bit_buffer(bb.finish())
-                        .build_unchecked(),
-                    None => arr_data_builder.build_unchecked(),
-                }
-            };
+                .len(slots)
+                .null_bit_buffer(Some(bitmap_builder.finish()));
+
+            let arr_data_ref = unsafe { arr_data_builder.build_unchecked() };
             let array_ref = make_array(arr_data_ref);
             children.push((type_id, (Field::new(&name, data_type, false), array_ref)))
         }
@@ -2153,9 +2218,10 @@ impl UnionBuilder {
                 .expect("This will never be None as type ids are always i8 values.")
         });
         let children: Vec<_> = children.into_iter().map(|(_, b)| b).collect();
-        let bitmap = self.bitmap_builder.map(|mut b| b.finish());
 
-        UnionArray::try_new(type_id_buffer, value_offsets_buffer, children, bitmap)
+        let type_ids: Vec<i8> = (0_i8..children.len() as i8).collect();
+
+        UnionArray::try_new(&type_ids, type_id_buffer, value_offsets_buffer, children)
     }
 }
 
@@ -2493,6 +2559,7 @@ mod tests {
 
     use crate::array::Array;
     use crate::bitmap::Bitmap;
+    use crate::util::decimal::Decimal128;
 
     #[test]
     fn test_builder_i32_empty() {
@@ -2624,7 +2691,8 @@ mod tests {
         let buffer = b.finish();
         assert_eq!(1, buffer.len());
 
-        let mut b = BooleanBufferBuilder::new(4);
+        // Overallocate capacity
+        let mut b = BooleanBufferBuilder::new(8);
         b.append_slice(&[false, true, false, true]);
         assert_eq!(4, b.len());
         assert_eq!(512, b.capacity());
@@ -2746,6 +2814,42 @@ mod tests {
     }
 
     #[test]
+    fn test_bool_buffer_fuzz() {
+        use rand::prelude::*;
+
+        let mut buffer = BooleanBufferBuilder::new(12);
+        let mut all_bools = vec![];
+        let mut rng = rand::thread_rng();
+
+        let src_len = 32;
+        let (src, compacted_src) = {
+            let src: Vec<_> = std::iter::from_fn(|| Some(rng.next_u32() & 1 == 0))
+                .take(src_len)
+                .collect();
+
+            let mut compacted_src = BooleanBufferBuilder::new(src_len);
+            compacted_src.append_slice(&src);
+            (src, compacted_src.finish())
+        };
+
+        for _ in 0..100 {
+            let a = rng.next_u32() as usize % src_len;
+            let b = rng.next_u32() as usize % src_len;
+
+            let start = a.min(b);
+            let end = a.max(b);
+
+            buffer.append_packed_range(start..end, compacted_src.as_slice());
+            all_bools.extend_from_slice(&src[start..end]);
+        }
+
+        let mut compacted = BooleanBufferBuilder::new(all_bools.len());
+        compacted.append_slice(&all_bools);
+
+        assert_eq!(buffer.finish(), compacted.finish())
+    }
+
+    #[test]
     fn test_boolean_array_builder_append_slice() {
         let arr1 =
             BooleanArray::from(vec![Some(true), Some(false), None, None, Some(false)]);
@@ -2769,6 +2873,29 @@ mod tests {
         let arr2 = builder.finish();
 
         assert_eq!(arr1, arr2);
+    }
+
+    #[test]
+    fn test_boolean_array_builder_resize() {
+        let mut builder = BooleanBufferBuilder::new(20);
+        builder.append_n(4, true);
+        builder.append_n(7, false);
+        builder.append_n(2, true);
+        builder.resize(20);
+
+        assert_eq!(builder.len, 20);
+        assert_eq!(
+            builder.buffer.as_slice(),
+            &[0b00001111, 0b00011000, 0b00000000]
+        );
+
+        builder.resize(5);
+        assert_eq!(builder.len, 5);
+        assert_eq!(builder.buffer.as_slice(), &[0b00001111]);
+
+        builder.append_n(4, true);
+        assert_eq!(builder.len, 9);
+        assert_eq!(builder.buffer.as_slice(), &[0b11101111, 0b00000001]);
     }
 
     #[test]
@@ -3343,14 +3470,34 @@ mod tests {
 
     #[test]
     fn test_decimal_builder() {
-        let mut builder = DecimalBuilder::new(30, 23, 6);
+        let mut builder = DecimalBuilder::new(30, 38, 6);
 
-        builder.append_value(8_887_000_000).unwrap();
+        builder.append_value(8_887_000_000_i128).unwrap();
         builder.append_null().unwrap();
-        builder.append_value(-8_887_000_000).unwrap();
+        builder.append_value(-8_887_000_000_i128).unwrap();
         let decimal_array: DecimalArray = builder.finish();
 
-        assert_eq!(&DataType::Decimal(23, 6), decimal_array.data_type());
+        assert_eq!(&DataType::Decimal(38, 6), decimal_array.data_type());
+        assert_eq!(3, decimal_array.len());
+        assert_eq!(1, decimal_array.null_count());
+        assert_eq!(32, decimal_array.value_offset(2));
+        assert_eq!(16, decimal_array.value_length());
+    }
+
+    #[test]
+    fn test_decimal_builder_with_decimal128() {
+        let mut builder = DecimalBuilder::new(30, 38, 6);
+
+        builder
+            .append_value(Decimal128::new_from_i128(30, 38, 8_887_000_000_i128))
+            .unwrap();
+        builder.append_null().unwrap();
+        builder
+            .append_value(Decimal128::new_from_i128(30, 38, -8_887_000_000_i128))
+            .unwrap();
+        let decimal_array: DecimalArray = builder.finish();
+
+        assert_eq!(&DataType::Decimal(38, 6), decimal_array.data_type());
         assert_eq!(3, decimal_array.len());
         assert_eq!(1, decimal_array.null_count());
         assert_eq!(32, decimal_array.value_offset(2));
@@ -3453,13 +3600,13 @@ mod tests {
         assert_eq!(4, struct_data.len());
         assert_eq!(1, struct_data.null_count());
         assert_eq!(
-            &Some(Bitmap::from(Buffer::from(&[11_u8]))),
+            Some(&Bitmap::from(Buffer::from(&[11_u8]))),
             struct_data.null_bitmap()
         );
 
         let expected_string_data = ArrayData::builder(DataType::Utf8)
             .len(4)
-            .null_bit_buffer(Buffer::from(&[9_u8]))
+            .null_bit_buffer(Some(Buffer::from(&[9_u8])))
             .add_buffer(Buffer::from_slice_ref(&[0, 3, 3, 3, 7]))
             .add_buffer(Buffer::from_slice_ref(b"joemark"))
             .build()
@@ -3467,7 +3614,7 @@ mod tests {
 
         let expected_int_data = ArrayData::builder(DataType::Int32)
             .len(4)
-            .null_bit_buffer(Buffer::from_slice_ref(&[11_u8]))
+            .null_bit_buffer(Some(Buffer::from_slice_ref(&[11_u8])))
             .add_buffer(Buffer::from_slice_ref(&[1, 2, 0, 4]))
             .build()
             .unwrap();
@@ -3567,13 +3714,13 @@ mod tests {
         assert_eq!(3, map_data.len());
         assert_eq!(1, map_data.null_count());
         assert_eq!(
-            &Some(Bitmap::from(Buffer::from(&[5_u8]))),
+            Some(&Bitmap::from(Buffer::from(&[5_u8]))),
             map_data.null_bitmap()
         );
 
         let expected_string_data = ArrayData::builder(DataType::Utf8)
             .len(4)
-            .null_bit_buffer(Buffer::from(&[9_u8]))
+            .null_bit_buffer(Some(Buffer::from(&[9_u8])))
             .add_buffer(Buffer::from_slice_ref(&[0, 3, 3, 3, 7]))
             .add_buffer(Buffer::from_slice_ref(b"joemark"))
             .build()
@@ -3581,7 +3728,7 @@ mod tests {
 
         let expected_int_data = ArrayData::builder(DataType::Int32)
             .len(4)
-            .null_bit_buffer(Buffer::from_slice_ref(&[11_u8]))
+            .null_bit_buffer(Some(Buffer::from_slice_ref(&[11_u8])))
             .add_buffer(Buffer::from_slice_ref(&[1, 2, 0, 4]))
             .build()
             .unwrap();
@@ -3596,12 +3743,14 @@ mod tests {
 
     #[test]
     fn test_struct_array_builder_from_schema() {
-        let mut fields = Vec::new();
-        fields.push(Field::new("f1", DataType::Float32, false));
-        fields.push(Field::new("f2", DataType::Utf8, false));
-        let mut sub_fields = Vec::new();
-        sub_fields.push(Field::new("g1", DataType::Int32, false));
-        sub_fields.push(Field::new("g2", DataType::Boolean, false));
+        let mut fields = vec![
+            Field::new("f1", DataType::Float32, false),
+            Field::new("f2", DataType::Utf8, false),
+        ];
+        let sub_fields = vec![
+            Field::new("g1", DataType::Int32, false),
+            Field::new("g2", DataType::Boolean, false),
+        ];
         let struct_type = DataType::Struct(sub_fields);
         fields.push(Field::new("f3", struct_type, false));
 
@@ -3617,8 +3766,7 @@ mod tests {
         expected = "Data type List(Field { name: \"item\", data_type: Int64, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: None }) is not currently supported"
     )]
     fn test_struct_array_builder_from_schema_unsupported_type() {
-        let mut fields = Vec::new();
-        fields.push(Field::new("f1", DataType::Int16, false));
+        let mut fields = vec![Field::new("f1", DataType::Int16, false)];
         let list_type =
             DataType::List(Box::new(Field::new("item", DataType::Int64, true)));
         fields.push(Field::new("f2", list_type, false));

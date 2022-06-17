@@ -17,7 +17,9 @@
 
 use std::{cell::RefCell, cmp, fmt, io::*};
 
-use crate::file::{reader::Length, writer::ParquetWriter};
+use crate::file::reader::Length;
+#[allow(deprecated)]
+use crate::file::writer::ParquetWriter;
 
 const DEFAULT_BUF_SIZE: usize = 8 * 1024;
 
@@ -156,6 +158,8 @@ impl<R: ParquetReader> Length for FileSource<R> {
 
 /// Struct that represents `File` output stream with position tracking.
 /// Used as a sink in file writer.
+#[deprecated = "use TrackedWrite instead"]
+#[allow(deprecated)]
 pub struct FileSink<W: ParquetWriter> {
     buf: BufWriter<W>,
     // This is not necessarily position in the underlying file,
@@ -163,6 +167,7 @@ pub struct FileSink<W: ParquetWriter> {
     pos: u64,
 }
 
+#[allow(deprecated)]
 impl<W: ParquetWriter> FileSink<W> {
     /// Creates new file sink.
     /// Position is set to whatever position file has.
@@ -176,6 +181,7 @@ impl<W: ParquetWriter> FileSink<W> {
     }
 }
 
+#[allow(deprecated)]
 impl<W: ParquetWriter> Write for FileSink<W> {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         let num_bytes = self.buf.write(buf)?;
@@ -188,6 +194,7 @@ impl<W: ParquetWriter> Write for FileSink<W> {
     }
 }
 
+#[allow(deprecated)]
 impl<W: ParquetWriter> Position for FileSink<W> {
     fn pos(&self) -> u64 {
         self.pos
@@ -207,7 +214,7 @@ mod tests {
 
     use std::iter;
 
-    use crate::util::test_common::{get_temp_file, get_test_file};
+    use crate::util::test_common::get_test_file;
 
     #[test]
     fn test_io_read_fully() {
@@ -271,9 +278,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_io_write_with_pos() {
-        let mut file = get_temp_file("file_sink_test", &[b'a', b'b', b'c']);
-        file.seek(SeekFrom::Current(3)).unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&[b'a', b'b', b'c']).unwrap();
 
         // Write into sink
         let mut sink = FileSink::new(&file);
@@ -300,8 +308,9 @@ mod tests {
             .flatten()
             .take(3 * DEFAULT_BUF_SIZE)
             .collect();
-        // always use different temp files as test might be run in parallel
-        let mut file = get_temp_file("large_file_sink_test", &patterned_data);
+
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&patterned_data).unwrap();
 
         // seek the underlying file to the first 'd'
         file.seek(SeekFrom::Start(3)).unwrap();

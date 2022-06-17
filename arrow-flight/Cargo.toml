@@ -18,31 +18,37 @@
 [package]
 name = "arrow-flight"
 description = "Apache Arrow Flight"
-version = "7.0.0-SNAPSHOT"
-edition = "2018"
+version = "16.0.0"
+edition = "2021"
+rust-version = "1.57"
 authors = ["Apache Arrow <dev@arrow.apache.org>"]
 homepage = "https://github.com/apache/arrow-rs"
 repository = "https://github.com/apache/arrow-rs"
 license = "Apache-2.0"
 
 [dependencies]
-arrow = { path = "../arrow", version = "7.0.0-SNAPSHOT" }
-base64 = "0.13"
-tonic = "0.5"
-bytes = "1"
-prost = "0.8"
-prost-derive = "0.8"
-tokio = { version = "1.0", features = ["macros", "rt", "rt-multi-thread"] }
-
-[dev-dependencies]
+arrow = { path = "../arrow", version = "16.0.0", default-features = false, features = ["ipc"] }
+base64 = { version = "0.13", default-features = false }
+tonic = { version = "0.7", default-features = false, features = ["transport", "codegen", "prost"] }
+bytes = { version = "1", default-features = false }
+prost = { version = "0.10", default-features = false }
+prost-types = { version = "0.10.0", default-features = false, optional = true }
+prost-derive = { version = "0.10", default-features = false }
+tokio = { version = "1.0", default-features = false, features = ["macros", "rt", "rt-multi-thread"] }
 futures = { version = "0.3", default-features = false, features = ["alloc"]}
 
+[features]
+default = []
+flight-sql-experimental = ["prost-types"]
+
+[dev-dependencies]
+
 [build-dependencies]
-tonic-build = "0.5"
+tonic-build = { version = "0.7", default-features = false, features = ["transport", "prost"] }
 # Pin specific version of the tonic-build dependencies to avoid auto-generated
 # (and checked in) arrow.flight.protocol.rs from changing
-proc-macro2 = "=1.0.27"
+proc-macro2 = { version = ">1.0.30", default-features = false }
 
-#[lib]
-#name = "flight"
-#path = "src/lib.rs"
+[[example]]
+name = "flight_sql_server"
+required-features = ["flight-sql-experimental"]

@@ -113,7 +113,7 @@ mod tests {
             .len(9)
             .add_buffer(value_offsets)
             .add_child_data(value_data)
-            .null_bit_buffer(Buffer::from(null_bits))
+            .null_bit_buffer(Some(Buffer::from(null_bits)))
             .build()
             .unwrap();
         let list_array: ArrayRef = Arc::new(ListArray::from(list_data));
@@ -145,24 +145,25 @@ mod tests {
         let boolean_data = ArrayData::builder(DataType::Boolean)
             .len(5)
             .add_buffer(Buffer::from([0b00010000]))
-            .null_bit_buffer(Buffer::from([0b00010001]))
+            .null_bit_buffer(Some(Buffer::from([0b00010001])))
             .build()
             .unwrap();
         let int_data = ArrayData::builder(DataType::Int32)
             .len(5)
             .add_buffer(Buffer::from_slice_ref(&[0, 28, 42, 0, 0]))
-            .null_bit_buffer(Buffer::from([0b00000110]))
+            .null_bit_buffer(Some(Buffer::from([0b00000110])))
             .build()
             .unwrap();
 
-        let mut field_types = vec![];
-        field_types.push(Field::new("a", DataType::Boolean, false));
-        field_types.push(Field::new("b", DataType::Int32, false));
+        let field_types = vec![
+            Field::new("a", DataType::Boolean, false),
+            Field::new("b", DataType::Int32, false),
+        ];
         let struct_array_data = ArrayData::builder(DataType::Struct(field_types))
             .len(5)
             .add_child_data(boolean_data.clone())
             .add_child_data(int_data.clone())
-            .null_bit_buffer(Buffer::from([0b00010111]))
+            .null_bit_buffer(Some(Buffer::from([0b00010111])))
             .build()
             .unwrap();
         let struct_array = StructArray::from(struct_array_data);

@@ -19,17 +19,20 @@
 
 # Apache Arrow Official Native Rust Implementation
 
-[![Crates.io](https://img.shields.io/crates/v/arrow.svg)](https://crates.io/crates/arrow)
+[![crates.io](https://img.shields.io/crates/v/arrow.svg)](https://crates.io/crates/arrow)
+[![docs.rs](https://img.shields.io/docsrs/arrow.svg)](https://docs.rs/arrow/latest/arrow/)
 
-This crate contains the official Native Rust implementation of [Apache Arrow][arrow] in memory format. Please see the API documents for additional details.
+This crate contains the official Native Rust implementation of [Apache Arrow][arrow] in memory format, governed by the Apache Software Foundation. Additional details can be found on [crates.io](https://crates.io/crates/arrow), [docs.rs](https://docs.rs/arrow/latest/arrow/) and [examples](https://github.com/apache/arrow-rs/tree/master/arrow/examples).
 
 ## Rust Version Compatibility
 
-This crate is tested with the latest stable version of Rust. We do not currently test against other, older versions of the Rust compiler.
+This crate is tested with the latest stable version of Rust. We do not currently test against other, older versions.
 
 ## Versioning / Releases
 
-Unlike many other crates in the Rust ecosystem which spend extended time in "pre 1.0.0" state, releasing versions 0.x, the arrow-rs crate follows the versioning scheme of the overall [Apache Arrow][arrow] project in an effort to signal which language implementations have been integration tested with each other.
+The arrow crate follows the [SemVer standard](https://doc.rust-lang.org/cargo/reference/semver.html) defined by Cargo and works well within the Rust crate ecosystem.
+
+However, for historical reasons, this crate uses versions with major numbers greater than `0.x` (e.g. `16.0.0`), unlike many other crates in the Rust ecosystem which spend extended time releasing versions `0.x` to signal planned ongoing API changes. Minor arrow releases contain only compatible changes, while major releases may contain breaking API changes.
 
 ## Features
 
@@ -40,27 +43,37 @@ The arrow crate provides the following features which may be enabled:
 - `prettyprint` - support for formatting record batches as textual columns
 - `js` - support for building arrow for WebAssembly / JavaScript
 - `simd` - (_Requires Nightly Rust_) alternate optimized
-  implementations of some [compute](https://github.com/apache/arrow/tree/master/rust/arrow/src/compute)
-  kernels using explicit SIMD processor intrinsics.
+  implementations of some [compute](https://github.com/apache/arrow-rs/tree/master/arrow/src/compute/kernels)
+  kernels using explicit SIMD instructions available through [packed_simd_2](https://docs.rs/packed_simd_2/latest/packed_simd_2/).
 - `chrono-tz` - support of parsing timezone using [chrono-tz](https://docs.rs/chrono-tz/0.6.0/chrono_tz/)
 
 ## Safety
 
-TLDR: You should avoid using the `alloc` and `buffer` and `bitmap` modules if at all possible. These modules contain `unsafe` code and are easy to misuse.
+Arrow seeks to uphold the Rust Soundness Pledge as articulated eloquently [here](https://raphlinus.github.io/rust/2020/01/18/soundness-pledge.html). Specifically:
 
-As with all open source code, you should carefully evaluate the suitability of `arrow` for your project, taking into consideration your needs and risk tolerance prior to use.
+> The intent of this crate is to be free of soundness bugs. The developers will do their best to avoid them, and welcome help in analyzing and fixing them
 
-_Background_: There are various parts of the `arrow` crate which use `unsafe` and `transmute` code internally. We are actively working as a community to minimize undefined behavior and remove `unsafe` usage to align more with Rust's core principles of safety (e.g. the arrow2 project).
+Where soundness in turn is defined as:
 
-As `arrow` exists today, it is fairly easy to misuse the APIs, leading to undefined behavior, and it is especially easy to misuse code in modules named above. For an example, as described in [the arrow2 crate](https://github.com/jorgecarleitao/arrow2#why), the following code compiles, does not panic, but results in undefined behavior:
+> Code is unable to trigger undefined behaviour using safe APIs
 
-```rust
-let buffer = Buffer::from_slice_ref(&[0i32, 2i32])
-let data = ArrayData::new(DataType::Int64, 10, 0, None, 0, vec![buffer], vec![]);
-let array = Float64Array::from(Arc::new(data));
+One way to ensure this would be to not use `unsafe`, however, as described in the opening chapter of the [Rustonomicon](https://doc.rust-lang.org/nomicon/meet-safe-and-unsafe.html) this is not a requirement, and flexibility in this regard is actually one of Rust's great strengths.
 
-println!("{:?}", array.value(1));
-```
+In particular there are a number of scenarios where `unsafe` is largely unavoidable:
+
+* Invariants that cannot be statically verified by the compiler and unlock non-trivial performance wins, e.g. values in a StringArray are UTF-8, [TrustedLen](https://doc.rust-lang.org/std/iter/trait.TrustedLen.html) iterators, etc...
+* FFI 
+* SIMD
+
+Additionally, this crate exposes a number of `unsafe` APIs, allowing downstream crates to explicitly opt-out of potentially expensive invariant checking where appropriate. 
+
+We have a number of strategies to help reduce this risk:
+
+* Provide strongly-typed `Array` and `ArrayBuilder` APIs to safely and efficiently interact with arrays
+* Extensive validation logic to safely construct `ArrayData` from untrusted sources
+* All commits are verified using [MIRI](https://github.com/rust-lang/miri) to detect undefined behaviour
+* We provide a `force_validate` feature that enables additional validation checks for use in test/debug builds
+* There is ongoing work to reduce and better document the use of unsafe, and we welcome contributions in this space
 
 ## Building for WASM
 
@@ -87,3 +100,17 @@ cargo run --example read_csv
 ```
 
 [arrow]: https://arrow.apache.org/
+
+
+## Performance
+
+Most of the compute kernels benefit a lot from being optimized for a specific CPU target.
+This is especially so on x86-64 since without specifying a target the compiler can only assume support for SSE2 vector instructions.
+One of the following values as `-Ctarget-cpu=value` in `RUSTFLAGS` can therefore improve performance significantly:
+
+ - `native`: Target the exact features of the cpu that the build is running on.
+   This should give the best performance when building and running locally, but should be used carefully for example when building in a CI pipeline or when shipping pre-compiled software. 
+ - `x86-64-v3`: Includes AVX2 support and is close to the intel `haswell` architecture released in 2013 and should be supported by any recent Intel or Amd cpu.
+ - `x86-64-v4`: Includes AVX512 support available on intel `skylake` server and `icelake`/`tigerlake`/`rocketlake` laptop and desktop processors.
+
+These flags should be used in addition to the `simd` feature, since they will also affect the code generated by the simd library. 

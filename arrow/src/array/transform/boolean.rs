@@ -15,12 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::{Extend, _MutableArrayData, utils::resize_for_bits};
 use crate::array::ArrayData;
-
-use super::{
-    Extend, _MutableArrayData,
-    utils::{resize_for_bits, set_bits},
-};
+use crate::util::bit_mask::set_bits;
 
 pub(super) fn build_extend(array: &ArrayData) -> Extend {
     let values = array.buffers()[0].as_slice();
@@ -29,7 +26,7 @@ pub(super) fn build_extend(array: &ArrayData) -> Extend {
             let buffer = &mut mutable.buffer1;
             resize_for_bits(buffer, mutable.len + len);
             set_bits(
-                &mut buffer.as_slice_mut(),
+                buffer.as_slice_mut(),
                 values,
                 mutable.len,
                 array.offset() + start,
