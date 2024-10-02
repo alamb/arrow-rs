@@ -299,6 +299,38 @@ mod test {
     }
 
     #[test]
+    // An example of reading footer metadata from an external file, but
+    // page indexes from the original file.
+    fn test_metadata_read_write_partial_roundtrip() {
+        let parquet_bytes = create_parquet_file();
+
+        // read full metadata
+        let correct_metadata = ParquetMetaDataReader::new()
+            .with_page_indexes(true)
+            .parse_and_finish(&parquet_bytes)
+            .unwrap();
+
+        // read the metadata from the file WITHOUT the page index structures
+        let original_metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&parquet_bytes)
+            .unwrap();
+
+        // read metadata back from the serialized bytes
+        let metadata_bytes = metadata_to_bytes(&original_metadata);
+        let roundtrip_metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&metadata_bytes)
+            .unwrap();
+        assert_eq!(original_metadata, roundtrip_metadata);
+
+        // now retrieve page index from original file
+        let mut reader = ParquetMetaDataReader::new_with_metadata(roundtrip_metadata)
+            .with_page_indexes(true);
+        reader.read_page_indexes(&parquet_bytes).unwrap();
+        let roundtrip_metadata = reader.finish().unwrap();
+        assert_eq!(correct_metadata, roundtrip_metadata);
+    }
+
+    #[test]
     // Reproducer for https://github.com/apache/arrow-rs/issues/6464 (this should eventually pass)
     #[should_panic(expected = "missing required field ColumnIndex.null_pages")]
     fn test_metadata_read_write_partial_offset() {
