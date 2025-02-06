@@ -15,18 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::io::Cursor;
 use arrow_array::builder::{Date32Builder, Decimal128Builder, Int32Builder};
 use arrow_array::{builder::StringBuilder, RecordBatch};
+use arrow_buffer::Buffer;
+use arrow_ipc::convert::fb_to_schema;
 use arrow_ipc::reader::{read_footer_length, FileDecoder, FileReader, StreamReader};
 use arrow_ipc::writer::{FileWriter, IpcWriteOptions, StreamWriter};
 use arrow_ipc::{root_as_footer, Block, CompressionType};
 use arrow_schema::{DataType, Field, Schema};
 use criterion::{criterion_group, criterion_main, Criterion};
+use std::io::Cursor;
 use std::sync::Arc;
-use tempfile::{tempdir};
-use arrow_buffer::Buffer;
-use arrow_ipc::convert::fb_to_schema;
+use tempfile::tempdir;
 
 fn criterion_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("arrow_ipc_stream_writer");
@@ -176,10 +176,12 @@ impl IPCBufferDecoder {
         let data = self
             .buffer
             .slice_with_length(block.offset() as _, block_len);
-        self.decoder.read_record_batch(block, &data).unwrap().unwrap()
+        self.decoder
+            .read_record_batch(block, &data)
+            .unwrap()
+            .unwrap()
     }
 }
-
 
 fn create_batch(num_rows: usize, allow_nulls: bool) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
