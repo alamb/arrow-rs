@@ -42,7 +42,10 @@ fn criterion_benchmark(c: &mut Criterion) {
 
         b.iter(move || {
             let projection = None;
-            let mut reader = StreamReader::try_new(buffer.as_slice(), projection).unwrap();
+            let mut reader = unsafe {
+                StreamReader::try_new(buffer.as_slice(), projection).unwrap()
+                    .with_skip_validation(true)
+            };
             for _ in 0..10 {
                 reader.next().unwrap().unwrap();
             }
@@ -66,7 +69,10 @@ fn criterion_benchmark(c: &mut Criterion) {
 
         b.iter(move || {
             let projection = None;
-            let mut reader = StreamReader::try_new(buffer.as_slice(), projection).unwrap();
+            let mut reader = unsafe {
+                StreamReader::try_new(buffer.as_slice(), projection).unwrap()
+                    .with_skip_validation(true)
+            };
             for _ in 0..10 {
                 reader.next().unwrap().unwrap();
             }
@@ -86,7 +92,10 @@ fn criterion_benchmark(c: &mut Criterion) {
         b.iter(move || {
             let projection = None;
             let cursor = Cursor::new(buffer.as_slice());
-            let mut reader = FileReader::try_new(cursor, projection).unwrap();
+            let mut reader = unsafe {
+                FileReader::try_new(cursor, projection).unwrap()
+                    .with_skip_validation(true)
+            };
             for _ in 0..10 {
                 reader.next().unwrap().unwrap();
             }
@@ -144,7 +153,9 @@ impl IPCBufferDecoder {
 
         let schema = fb_to_schema(footer.schema().unwrap());
 
-        let mut decoder = FileDecoder::new(Arc::new(schema), footer.version());
+        let mut decoder = unsafe {
+            FileDecoder::new(Arc::new(schema), footer.version()).with_skip_validation(true)
+        };
 
         // Read dictionaries
         for block in footer.dictionaries().iter().flatten() {

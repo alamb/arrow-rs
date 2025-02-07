@@ -934,6 +934,7 @@ impl FileDecoder {
                 )?
                 .with_projection(self.projection.as_deref())
                 .with_require_alignment(self.require_alignment)
+                    .with_skip_validation(self.skip_validation)
                 .read_record_batch()
                 .map(Some)
             }
@@ -954,6 +955,7 @@ pub struct FileReaderBuilder {
     max_footer_fb_tables: usize,
     /// Passed through to construct [`VerifierOptions`]
     max_footer_fb_depth: usize,
+    skip_validation: UnsafeFlag,
 }
 
 impl Default for FileReaderBuilder {
@@ -963,6 +965,7 @@ impl Default for FileReaderBuilder {
             max_footer_fb_tables: verifier_options.max_tables,
             max_footer_fb_depth: verifier_options.max_depth,
             projection: None,
+            skip_validation: Default::default()
         }
     }
 }
@@ -978,6 +981,21 @@ impl FileReaderBuilder {
     /// Optional projection for which columns to load (zero-based column indices).
     pub fn with_projection(mut self, projection: Vec<usize>) -> Self {
         self.projection = Some(projection);
+        self
+    }
+
+    /// Specifies whether validation should be skipped when reading data (default to `false`)
+    ///
+    /// # Safety
+    ///
+    /// This flag must only be set to `true` when you trust and are sure the data you are
+    /// reading is a valid Arrow IPC file, otherwise undefined behavior may
+    /// result.
+    ///
+    /// For example, some programs may wish to trust reading IPC files written
+    /// by the same process that created the files.
+    pub unsafe fn with_skip_validation(mut self, skip_validation: bool) -> Self {
+        self.skip_validation.set(skip_validation);
         self
     }
 
@@ -1075,6 +1093,7 @@ impl FileReaderBuilder {
                 decoder.read_dictionary(block, &buf)?;
             }
         }
+        decoder.skip_validation = self.skip_validation;
 
         Ok(FileReader {
             reader,
@@ -1243,6 +1262,21 @@ impl<R: Read + Seek> FileReader<R> {
     /// It is inadvisable to directly read from the underlying reader.
     pub fn get_mut(&mut self) -> &mut R {
         &mut self.reader
+    }
+
+    /// Specifies whether validation should be skipped when reading data (default to `false`)
+    ///
+    /// # Safety
+    ///
+    /// This flag must only be set to `true` when you trust and are sure the data you are
+    /// reading is a valid Arrow IPC file, otherwise undefined behavior may
+    /// result.
+    ///
+    /// For example, some programs may wish to trust reading IPC files written
+    /// by the same process that created the files.
+    pub unsafe fn with_skip_validation(mut self, skip_validation: bool) -> Self {
+        self.decoder = self.decoder.with_skip_validation(skip_validation);
+        self
     }
 }
 
@@ -1488,6 +1522,7 @@ impl<R: Read> StreamReader<R> {
                 )?
                 .with_projection(self.projection.as_ref().map(|x| x.0.as_ref()))
                 .with_require_alignment(false)
+                    .with_skip_validation(self.skip_validation)
                 .read_record_batch()
                 .map(Some)
             }
