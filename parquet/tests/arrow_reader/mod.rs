@@ -40,6 +40,9 @@ mod bad_data;
 mod checksum;
 mod statistics;
 
+#[cfg(feature = "encryption")]
+mod encryption;
+
 // returns a struct array with columns "int32_col", "float32_col" and "float64_col" with the specified values
 fn struct_array(input: Vec<(Option<i32>, Option<f32>, Option<f64>)>) -> ArrayRef {
     let int_32: Int32Array = input.iter().map(|(i, _, _)| i).collect();
