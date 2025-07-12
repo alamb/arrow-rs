@@ -706,7 +706,7 @@ impl VariantBuilder {
         }
     }
 
-    /// Create a new VariantBuilder that will write the metadata and values to
+    /// Create a new VariantBuilder that will append the metadata and values to
     /// the specified buffers.
     pub fn new_with_buffers(metadata_buffer: Vec<u8>, value_buffer: Vec<u8>) -> Self {
         Self {
