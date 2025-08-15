@@ -500,7 +500,8 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
             metrics,
             max_predicate_cache_size,
         } = self;
-        let file_len = input.len();
+        // TODO remove file length here (it is only needed for the metadata decoder)
+        let file_len = 0;
         let decoder = ParquetPushDecoderBuilder {
             input: file_len,
             metadata,
