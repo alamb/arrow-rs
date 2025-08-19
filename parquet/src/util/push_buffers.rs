@@ -189,12 +189,15 @@ impl ChunkReader for PushBuffers {
     }
 
     fn get_bytes(&self, start: u64, length: usize) -> Result<Bytes, ParquetError> {
+        // Does the reader really need to know the length of the file?
+        /**
         if start > self.file_len {
             return Err(ParquetError::General(format!(
                 "Requested start {start} is beyond the end of the file (file length: {})",
                 self.file_len
             )));
         }
+**/
 
         // find the range that contains the start offset
         for (range, data) in self.iter() {
