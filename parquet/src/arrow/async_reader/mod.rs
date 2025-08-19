@@ -524,6 +524,7 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
     }
 }
 
+/// State machine that tracks outstanding requests to fetch data
 enum RequestState<T> {
     /// No outstanding requests
     None {
@@ -649,53 +650,54 @@ where
     ///
     /// returns a Result<Poll<Option<RecordBatch>>> so we can use ? operator to check for errors
     fn poll_next_inner(&mut self, cx: &mut Context<'_>) -> Result<Poll<Option<RecordBatch>>> {
-        let request_state = std::mem::replace(&mut self.request_state, RequestState::Done);
-
-        match request_state {
-            RequestState::None { mut input } => {
-                // No outstanding requests, proceed to decode the next batch
-                match self.decoder.try_decode()? {
-                    DecodeResult::NeedsData(ranges) => {
-                        // issue a poll to get the ranges from the input. Need to move the
-                        // input into the future because the get_byte_ranges future has a
-                        // lifetime (aka can have references internally)
-                        let ranges_captured = ranges.clone();
-                        let future = async move {
-                            let data = input.get_byte_ranges(ranges_captured).await?;
-                            Ok((input, data))
+        loop {
+            let request_state = std::mem::replace(&mut self.request_state, RequestState::Done);
+            match request_state {
+                RequestState::None { mut input } => {
+                    // No outstanding requests, proceed to decode the next batch
+                    match self.decoder.try_decode()? {
+                        DecodeResult::NeedsData(ranges) => {
+                            // issue a poll to get the ranges from the input. Need to move the
+                            // input into the future because the get_byte_ranges future has a
+                            // lifetime (aka can have references internally)
+                            let ranges_captured = ranges.clone();
+                            let future = async move {
+                                let data = input.get_byte_ranges(ranges_captured).await?;
+                                Ok((input, data))
+                            }
+                                .boxed();
+                            self.request_state = RequestState::Outstanding { ranges, future };
+                            continue; // poll again (as the input might be ready immediately)
                         }
-                        .boxed();
-                        self.request_state = RequestState::Outstanding { ranges, future };
-                        Ok(Poll::Pending) // pending until the future resolves
+                        DecodeResult::Data(batch) => {
+                            self.request_state = RequestState::None { input };
+                            return Ok(Poll::Ready(Some(batch)))
+                        }
+                        DecodeResult::Finished => {
+                            self.request_state = RequestState::Done;
+                            return Ok(Poll::Ready(None))
+                        }
                     }
-                    DecodeResult::Data(batch) => {
+                }
+                RequestState::Outstanding { ranges, mut future } => match future.poll_unpin(cx) {
+                    // Data was ready, push it to the decoder and continue
+                    Poll::Ready(result) => {
+                        let (input, data) = result?;
+                        // Push the requested data to the decoder
+                        self.decoder.push_ranges(ranges, data)?;
                         self.request_state = RequestState::None { input };
-                        Ok(Poll::Ready(Some(batch)))
+                        continue; // next iteration will try to decode the next batch
                     }
-                    DecodeResult::Finished => {
-                        self.request_state = RequestState::Done;
-                        Ok(Poll::Ready(None))
+                    Poll::Pending => {
+                        self.request_state = RequestState::Outstanding { ranges, future };
+                        return Ok(Poll::Pending)
                     }
+                },
+                RequestState::Done => {
+                    // Stream is done (error or end), return None
+                    self.request_state = RequestState::Done;
+                    return Ok(Poll::Ready(None))
                 }
-            }
-            RequestState::Outstanding { ranges, mut future } => match future.poll_unpin(cx) {
-                // Data was ready, push it to the decoder and continue
-                Poll::Ready(result) => {
-                    let (input, data) = result?;
-                    // Push the requested data to the decoder
-                    self.decoder.push_ranges(ranges, data)?;
-                    self.request_state = RequestState::None { input };
-                    self.poll_next_inner(cx)
-                }
-                Poll::Pending => {
-                    self.request_state = RequestState::Outstanding { ranges, future };
-                    Ok(Poll::Pending)
-                }
-            },
-            RequestState::Done => {
-                // Stream is done (error or end), return None
-                self.request_state = RequestState::Done;
-                Ok(Poll::Ready(None))
             }
         }
     }
