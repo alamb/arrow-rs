@@ -34,7 +34,7 @@ use futures::stream::Stream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
 
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, Schema, SchemaRef};
 
 use crate::arrow::arrow_reader::{
     ArrowReaderBuilder, ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
@@ -494,12 +494,20 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
             metrics,
             max_predicate_cache_size,
         } = self;
+
+        // Ensure schema of ParquetRecordBatchStream respects projection, and does
+        // not store metadata (same as for ParquetRecordBatchReader and emitted RecordBatches)
+        let projected_fields = schema
+            .fields
+            .filter_leaves(|idx, _| projection.leaf_included(idx));
+        let projected_schema = Arc::new(Schema::new(projected_fields));
+
         // TODO remove file length here (it is only needed for the metadata decoder)
         let file_len = 0;
         let decoder = ParquetPushDecoderBuilder {
             input: file_len,
             metadata,
-            schema: Arc::clone(&schema),
+            schema,
             fields,
             projection,
             filter,
@@ -517,7 +525,7 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
         let request_state = RequestState::None { input };
 
         Ok(ParquetRecordBatchStream {
-            schema,
+            schema: projected_schema,
             decoder,
             request_state,
         })
@@ -665,17 +673,17 @@ where
                                 let data = input.get_byte_ranges(ranges_captured).await?;
                                 Ok((input, data))
                             }
-                                .boxed();
+                            .boxed();
                             self.request_state = RequestState::Outstanding { ranges, future };
                             continue; // poll again (as the input might be ready immediately)
                         }
                         DecodeResult::Data(batch) => {
                             self.request_state = RequestState::None { input };
-                            return Ok(Poll::Ready(Some(batch)))
+                            return Ok(Poll::Ready(Some(batch)));
                         }
                         DecodeResult::Finished => {
                             self.request_state = RequestState::Done;
-                            return Ok(Poll::Ready(None))
+                            return Ok(Poll::Ready(None));
                         }
                     }
                 }
@@ -690,13 +698,13 @@ where
                     }
                     Poll::Pending => {
                         self.request_state = RequestState::Outstanding { ranges, future };
-                        return Ok(Poll::Pending)
+                        return Ok(Poll::Pending);
                     }
                 },
                 RequestState::Done => {
                     // Stream is done (error or end), return None
                     self.request_state = RequestState::Done;
-                    return Ok(Poll::Ready(None))
+                    return Ok(Poll::Ready(None));
                 }
             }
         }
