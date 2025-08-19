@@ -21,22 +21,20 @@
 //!
 //! See example on [`ParquetRecordBatchStreamBuilder::new`]
 
-use std::collections::VecDeque;
 use std::fmt::Formatter;
 use std::io::SeekFrom;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use futures::future::{BoxFuture, FutureExt};
-use futures::ready;
 use futures::stream::Stream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
 
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType, Fields, Schema, SchemaRef};
+use arrow_schema::SchemaRef;
 
 use crate::arrow::arrow_reader::{
     ArrowReaderBuilder, ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
@@ -57,12 +55,8 @@ pub use metadata::*;
 #[cfg(feature = "object_store")]
 mod store;
 
-use crate::arrow::array_reader::{ArrayReaderBuilder, CacheOptionsBuilder, RowGroupCache};
-use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
-use crate::arrow::arrow_reader::ReadPlanBuilder;
 use crate::arrow::in_memory_row_group::{FetchRanges, InMemoryRowGroup};
 use crate::arrow::push_decoder::{ParquetPushDecoder, ParquetPushDecoderBuilder};
-use crate::arrow::schema::ParquetField;
 use crate::DecodeResult;
 #[cfg(feature = "object_store")]
 pub use store::*;
@@ -519,7 +513,44 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
         }
         .build()?;
 
-        Ok(ParquetRecordBatchStream { decoder, input })
+        let request_state = RequestState::None;
+        let input = input.0;
+
+        Ok(ParquetRecordBatchStream {
+            decoder,
+            request_state,
+            input,
+        })
+    }
+}
+
+enum RequestState {
+    /// No outstanding requests
+    None,
+    /// There is an outstanding request for data
+    Outstanding {
+        /// The ranges that have been requested
+        ranges: Vec<Range<u64>>,
+        /// The future that will resolve to the data for the requested ranges
+        future: BoxFuture<'static, Result<Vec<Bytes>>>,
+    },
+    Done,
+}
+
+impl std::fmt::Debug for RequestState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RequestState::None => {
+                write!(f, "RequestState::None")
+            }
+            RequestState::Outstanding { ranges, .. } => f
+                .debug_struct("RequestState::Outstanding")
+                .field("ranges", &ranges)
+                .finish(),
+            RequestState::Done => {
+                write!(f, "RequestState::Done")
+            }
+        }
     }
 }
 
@@ -541,15 +572,15 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
 ///
 /// [`Stream`]: https://docs.rs/futures/latest/futures/stream/trait.Stream.html
 pub struct ParquetRecordBatchStream<T> {
+    request_state: RequestState,
     decoder: ParquetPushDecoder,
-    input: AsyncReader<T>,
+    input: T,
 }
 
 impl<T> std::fmt::Debug for ParquetRecordBatchStream<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ParquetRecordBatchStream")
-            .field("decoder", &self.decoder)
-            .field("input", &"...")
+            .field("request_state", &self.request_state)
             .finish()
     }
 }
@@ -592,20 +623,62 @@ where
     T: AsyncFileReader + Unpin + Send + 'static,
 {
     type Item = Result<RecordBatch>;
-
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let decode_result = match self.decoder.try_decode() {
-            Err(e) => return Poll::Ready(Some(Err(e))),
-            Ok(decode_result) => decode_result,
+        match self.poll_next_inner(cx) {
+            Ok(res) => {
+                // Successfully decoded a batch, or reached end of stream.
+                // convert Option<RecordBatch> to Option<Result<RecordBatch>>
+                res.map(|res| Ok(res).transpose())
+            }
+            Err(e) => {
+                self.request_state = RequestState::Done;
+                Poll::Ready(Some(Err(e)))
+            }
+        }
+    }
+}
+
+impl<T> ParquetRecordBatchStream<T>
+where
+    T: AsyncFileReader + Unpin + Send + 'static,
+{
+    /// Inner state machien logic
+    ///
+    /// returns a Result<Poll<Option<RecordBatch>>> so we can use ? operator to check for errors
+    fn poll_next_inner(&mut self, cx: &mut Context<'_>) -> Result<Poll<Option<RecordBatch>>> {
+        match &mut self.request_state {
+            RequestState::None => {
+                // No outstanding requests, proceed to decode the next batch
+            }
+            RequestState::Outstanding { ranges, future } => match future.poll_unpin(cx) {
+                Poll::Ready(result) => {
+                    let data = result?;
+                    let ranges = std::mem::take(ranges);
+                    // Push the requested data to the decoder
+                    self.decoder.push_ranges(ranges, data)?;
+                }
+                Poll::Pending => {
+                    // still waiting, need to poll again
+                    return Ok(Poll::Pending);
+                }
+            },
+            RequestState::Done => {
+                // Stream is done (error or end), return None
+                return Ok(Poll::Ready(None));
+            }
         };
 
-        match decode_result {
+        // try to decode the next batch
+        match self.decoder.try_decode()? {
             DecodeResult::NeedsData(ranges) => {
-                // todo: issue a poll to get the ranges from the inner
-                todo!();
+                // issue a poll to get the ranges from the input
+                let future = self.input.get_byte_ranges(ranges.clone());
+                self.request_state = RequestState::Outstanding { ranges, future };
+                // Poll again to wait for the data to be fetched
+                Ok(Poll::Pending)
             }
-            DecodeResult::Data(batch) => Poll::Ready(Some(Ok(batch))),
-            DecodeResult::Finished => return Poll::Ready(None),
+            DecodeResult::Data(batch) => Ok(Poll::Ready(Some(batch))),
+            DecodeResult::Finished => Ok(Poll::Ready(None)),
         }
     }
 }
@@ -643,7 +716,6 @@ mod tests {
         ArrowPredicateFn, ParquetRecordBatchReaderBuilder, RowSelector,
     };
     use crate::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
-    use crate::arrow::schema::parquet_to_arrow_schema_and_fields;
     use crate::arrow::ArrowWriter;
     use crate::file::metadata::ParquetMetaDataReader;
     use crate::file::properties::WriterProperties;
