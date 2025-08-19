@@ -499,7 +499,7 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
         let decoder = ParquetPushDecoderBuilder {
             input: file_len,
             metadata,
-            schema,
+            schema: Arc::clone(&schema),
             fields,
             projection,
             filter,
@@ -513,36 +513,39 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
         }
         .build()?;
 
-        let request_state = RequestState::None;
         let input = input.0;
+        let request_state = RequestState::None { input };
 
         Ok(ParquetRecordBatchStream {
+            schema,
             decoder,
             request_state,
-            input,
         })
     }
 }
 
-enum RequestState {
+enum RequestState<T> {
     /// No outstanding requests
-    None,
+    None {
+        input: T,
+    },
     /// There is an outstanding request for data
     Outstanding {
         /// The ranges that have been requested
         ranges: Vec<Range<u64>>,
-        /// The future that will resolve to the data for the requested ranges
-        future: BoxFuture<'static, Result<Vec<Bytes>>>,
+        /// The future that will resolve (input, requested_ranges)
+        future: BoxFuture<'static, Result<(T, Vec<Bytes>)>>,
     },
     Done,
 }
 
-impl std::fmt::Debug for RequestState {
+impl<T> std::fmt::Debug for RequestState<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            RequestState::None => {
-                write!(f, "RequestState::None")
-            }
+            RequestState::None { input: _ } => f
+                .debug_struct("RequestState::None")
+                .field("input", &"...")
+                .finish(),
             RequestState::Outstanding { ranges, .. } => f
                 .debug_struct("RequestState::Outstanding")
                 .field("ranges", &ranges)
@@ -572,9 +575,9 @@ impl std::fmt::Debug for RequestState {
 ///
 /// [`Stream`]: https://docs.rs/futures/latest/futures/stream/trait.Stream.html
 pub struct ParquetRecordBatchStream<T> {
-    request_state: RequestState,
+    schema: SchemaRef,
+    request_state: RequestState<T>,
     decoder: ParquetPushDecoder,
-    input: T,
 }
 
 impl<T> std::fmt::Debug for ParquetRecordBatchStream<T> {
@@ -591,7 +594,7 @@ impl<T> ParquetRecordBatchStream<T> {
     /// Note that the schema metadata will be stripped here. See
     /// [`ParquetRecordBatchStreamBuilder::schema`] if the metadata is desired.
     pub fn schema(&self) -> &SchemaRef {
-        self.decoder.schema()
+        &self.schema
     }
 }
 
@@ -646,39 +649,54 @@ where
     ///
     /// returns a Result<Poll<Option<RecordBatch>>> so we can use ? operator to check for errors
     fn poll_next_inner(&mut self, cx: &mut Context<'_>) -> Result<Poll<Option<RecordBatch>>> {
-        match &mut self.request_state {
-            RequestState::None => {
+        let request_state = std::mem::replace(&mut self.request_state, RequestState::Done);
+
+        match request_state {
+            RequestState::None { mut input } => {
                 // No outstanding requests, proceed to decode the next batch
+                match self.decoder.try_decode()? {
+                    DecodeResult::NeedsData(ranges) => {
+                        // issue a poll to get the ranges from the input. Need to move the
+                        // input into the future because the get_byte_ranges future has a
+                        // lifetime (aka can have references internally)
+                        let ranges_captured = ranges.clone();
+                        let future = async move {
+                            let data = input.get_byte_ranges(ranges_captured).await?;
+                            Ok((input, data))
+                        }
+                        .boxed();
+                        self.request_state = RequestState::Outstanding { ranges, future };
+                        Ok(Poll::Pending) // pending until the future resolves
+                    }
+                    DecodeResult::Data(batch) => {
+                        self.request_state = RequestState::None { input };
+                        Ok(Poll::Ready(Some(batch)))
+                    }
+                    DecodeResult::Finished => {
+                        self.request_state = RequestState::Done;
+                        Ok(Poll::Ready(None))
+                    }
+                }
             }
-            RequestState::Outstanding { ranges, future } => match future.poll_unpin(cx) {
+            RequestState::Outstanding { ranges, mut future } => match future.poll_unpin(cx) {
+                // Data was ready, push it to the decoder and continue
                 Poll::Ready(result) => {
-                    let data = result?;
-                    let ranges = std::mem::take(ranges);
+                    let (input, data) = result?;
                     // Push the requested data to the decoder
                     self.decoder.push_ranges(ranges, data)?;
+                    self.request_state = RequestState::None { input };
+                    self.poll_next_inner(cx)
                 }
                 Poll::Pending => {
-                    // still waiting, need to poll again
-                    return Ok(Poll::Pending);
+                    self.request_state = RequestState::Outstanding { ranges, future };
+                    Ok(Poll::Pending)
                 }
             },
             RequestState::Done => {
                 // Stream is done (error or end), return None
-                return Ok(Poll::Ready(None));
+                self.request_state = RequestState::Done;
+                Ok(Poll::Ready(None))
             }
-        };
-
-        // try to decode the next batch
-        match self.decoder.try_decode()? {
-            DecodeResult::NeedsData(ranges) => {
-                // issue a poll to get the ranges from the input
-                let future = self.input.get_byte_ranges(ranges.clone());
-                self.request_state = RequestState::Outstanding { ranges, future };
-                // Poll again to wait for the data to be fetched
-                Ok(Poll::Pending)
-            }
-            DecodeResult::Data(batch) => Ok(Poll::Ready(Some(batch))),
-            DecodeResult::Finished => Ok(Poll::Ready(None)),
         }
     }
 }

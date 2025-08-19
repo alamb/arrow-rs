@@ -29,7 +29,6 @@ use crate::file::metadata::ParquetMetaData;
 use crate::util::push_buffers::PushBuffers;
 use crate::DecodeResult;
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
 use bytes::Bytes;
 use reader_builder::RowGroupReaderBuilder;
 use remaining::RemainingRowGroups;
@@ -312,11 +311,6 @@ impl ParquetPushDecoder {
     /// This can be used to monitor memory usage of the decoder.
     pub fn buffered_bytes(&self) -> u64 {
         self.state.buffered_bytes()
-    }
-
-    /// Return the schema of the decoded RecordBatches
-    pub fn schema(&self) -> &SchemaRef {
-        todo!()
     }
 }
 
