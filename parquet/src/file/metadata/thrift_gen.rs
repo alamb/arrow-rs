@@ -125,7 +125,7 @@ struct FileMetaData<'a> {
   1: required i32 version
   2: required list<'a><SchemaElement> schema;
   3: required i64 num_rows
-  4: required list<'a><RowGroup> row_groups
+  4: required list<RowGroup> row_groups
   5: optional list<KeyValue> key_value_metadata
   6: optional string created_by
   7: optional list<ColumnOrder> column_orders;
@@ -135,8 +135,8 @@ struct FileMetaData<'a> {
 );
 
 thrift_struct!(
-struct RowGroup<'a> {
-  1: required list<'a><ColumnChunk> columns
+struct RowGroup {
+  1: required list<ColumnChunk> columns
   2: required i64 total_byte_size
   3: required i64 num_rows
   4: optional list<SortingColumn> sorting_columns
@@ -163,10 +163,10 @@ struct ColumnChunk<'a> {
 );
 #[cfg(not(feature = "encryption"))]
 thrift_struct!(
-struct ColumnChunk<'a> {
+struct ColumnChunk {
   1: optional string file_path
   2: required i64 file_offset = 0
-  3: optional ColumnMetaData<'a> meta_data
+  3: optional ColumnMetaData meta_data
   4: optional i64 offset_index_offset
   5: optional i32 offset_index_length
   6: optional i64 column_index_offset
@@ -176,7 +176,7 @@ struct ColumnChunk<'a> {
 
 type CompressionCodec = Compression;
 thrift_struct!(
-struct ColumnMetaData<'a> {
+struct ColumnMetaData {
   1: required Type type_
   2: required list<Encoding> encodings
   // we don't expose path_in_schema so skip
@@ -190,11 +190,14 @@ struct ColumnMetaData<'a> {
   9: required i64 data_page_offset
   10: optional i64 index_page_offset
   11: optional i64 dictionary_page_offset
-  12: optional Statistics<'a> statistics
+  // TEMP HACK: skip statistics to see how fast
+  // thrift can be parsed without them
+  //12: optional Statistics<'a> statistics
   13: optional list<PageEncodingStats> encoding_stats;
   14: optional i64 bloom_filter_offset;
   15: optional i32 bloom_filter_length;
-  16: optional SizeStatistics size_statistics;
+        // TEMP HACK: skip size_statistics to see how fast we can decode without it
+  //16: optional SizeStatistics size_statistics;
   17: optional GeospatialStatistics geospatial_statistics;
 }
 );
@@ -317,7 +320,8 @@ fn convert_column(
     let data_page_offset = col_metadata.data_page_offset;
     let index_page_offset = col_metadata.index_page_offset;
     let dictionary_page_offset = col_metadata.dictionary_page_offset;
-    let statistics = convert_stats(column_type, col_metadata.statistics)?;
+    //let statistics = convert_stats(column_type, col_metadata.statistics)?;
+    let statistics = None;
     let encoding_stats = col_metadata.encoding_stats;
     let bloom_filter_offset = col_metadata.bloom_filter_offset;
     let bloom_filter_length = col_metadata.bloom_filter_length;
@@ -325,21 +329,24 @@ fn convert_column(
     let offset_index_length = column.offset_index_length;
     let column_index_offset = column.column_index_offset;
     let column_index_length = column.column_index_length;
-    let (unencoded_byte_array_data_bytes, repetition_level_histogram, definition_level_histogram) =
-        if let Some(size_stats) = col_metadata.size_statistics {
-            (
-                size_stats.unencoded_byte_array_data_bytes,
-                size_stats.repetition_level_histogram,
-                size_stats.definition_level_histogram,
-            )
-        } else {
-            (None, None, None)
-        };
+    let unencoded_byte_array_data_bytes = None;
+    // let (unencoded_byte_array_data_bytes, repetition_level_histogram, definition_level_histogram) =
+    //     if let Some(size_stats) = col_metadata.size_statistics {
+    //         (
+    //             size_stats.unencoded_byte_array_data_bytes,
+    //             size_stats.repetition_level_histogram,
+    //             size_stats.definition_level_histogram,
+    //         )
+    //     } else {
+    //         (None, None, None)
+    //     };
 
     let geo_statistics = convert_geo_stats(col_metadata.geospatial_statistics);
 
-    let repetition_level_histogram = repetition_level_histogram.map(LevelHistogram::from);
-    let definition_level_histogram = definition_level_histogram.map(LevelHistogram::from);
+    //let repetition_level_histogram = repetition_level_histogram.map(LevelHistogram::from);
+    //let definition_level_histogram = definition_level_histogram.map(LevelHistogram::from);
+    let repetition_level_histogram = None;
+    let definition_level_histogram = None;
 
     let result = ColumnChunkMetaData {
         column_descr,
