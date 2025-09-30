@@ -153,12 +153,12 @@ struct ColumnChunk<'a> {
   1: optional string<'a> file_path
   2: required i64 file_offset = 0
   3: optional ColumnMetaData<'a> meta_data
-  4: optional i64 offset_index_offset
-  5: optional i32 offset_index_length
-  6: optional i64 column_index_offset
-  7: optional i32 column_index_length
+  //4: optional i64 offset_index_offset
+  //5: optional i32 offset_index_length
+  //6: optional i64 column_index_offset
+  //7: optional i32 column_index_length
   8: optional ColumnCryptoMetaData crypto_metadata
-  9: optional binary<'a> encrypted_column_metadata
+  //9: optional binary<'a> encrypted_column_metadata
 }
 );
 #[cfg(not(feature = "encryption"))]
@@ -167,10 +167,10 @@ struct ColumnChunk {
   1: optional string file_path
   2: required i64 file_offset = 0
   3: optional ColumnMetaData meta_data
-  4: optional i64 offset_index_offset
-  5: optional i32 offset_index_length
-  6: optional i64 column_index_offset
-  7: optional i32 column_index_length
+  //4: optional i64 offset_index_offset
+  //5: optional i32 offset_index_length
+  //6: optional i64 column_index_offset
+  //7: optional i32 column_index_length
 }
 );
 
@@ -325,10 +325,14 @@ fn convert_column(
     let encoding_stats = col_metadata.encoding_stats;
     let bloom_filter_offset = col_metadata.bloom_filter_offset;
     let bloom_filter_length = col_metadata.bloom_filter_length;
-    let offset_index_offset = column.offset_index_offset;
-    let offset_index_length = column.offset_index_length;
-    let column_index_offset = column.column_index_offset;
-    let column_index_length = column.column_index_length;
+    //let offset_index_offset = column.offset_index_offset;
+    //let offset_index_length = column.offset_index_length;
+    //let column_index_offset = column.column_index_offset;
+    //let column_index_length = column.column_index_length;
+    let offset_index_offset = None;
+    let offset_index_length = None;
+    let column_index_offset = None;
+    let column_index_length = None;
     let unencoded_byte_array_data_bytes = None;
     // let (unencoded_byte_array_data_bytes, repetition_level_histogram, definition_level_histogram) =
     //     if let Some(size_stats) = col_metadata.size_statistics {
