@@ -193,12 +193,12 @@ struct ColumnMetaData {
   // TEMP HACK: skip statistics to see how fast
   // thrift can be parsed without them
   //12: optional Statistics<'a> statistics
-  13: optional list<PageEncodingStats> encoding_stats;
-  14: optional i64 bloom_filter_offset;
-  15: optional i32 bloom_filter_length;
+  //13: optional list<PageEncodingStats> encoding_stats;
+  //14: optional i64 bloom_filter_offset;
+  //15: optional i32 bloom_filter_length;
         // TEMP HACK: skip size_statistics to see how fast we can decode without it
   //16: optional SizeStatistics size_statistics;
-  17: optional GeospatialStatistics geospatial_statistics;
+  //17: optional GeospatialStatistics geospatial_statistics;
 }
 );
 
@@ -322,13 +322,16 @@ fn convert_column(
     let dictionary_page_offset = col_metadata.dictionary_page_offset;
     //let statistics = convert_stats(column_type, col_metadata.statistics)?;
     let statistics = None;
-    let encoding_stats = col_metadata.encoding_stats;
-    let bloom_filter_offset = col_metadata.bloom_filter_offset;
-    let bloom_filter_length = col_metadata.bloom_filter_length;
+    //let encoding_stats = col_metadata.encoding_stats;
+    //let bloom_filter_offset = col_metadata.bloom_filter_offset;
+    //let bloom_filter_length = col_metadata.bloom_filter_length;
     //let offset_index_offset = column.offset_index_offset;
     //let offset_index_length = column.offset_index_length;
     //let column_index_offset = column.column_index_offset;
     //let column_index_length = column.column_index_length;
+    let encoding_stats = None;
+    let bloom_filter_offset = None;
+    let bloom_filter_length = None;
     let offset_index_offset = None;
     let offset_index_length = None;
     let column_index_offset = None;
@@ -345,7 +348,8 @@ fn convert_column(
     //         (None, None, None)
     //     };
 
-    let geo_statistics = convert_geo_stats(col_metadata.geospatial_statistics);
+    // let geo_statistics = convert_geo_stats(col_metadata.geospatial_statistics);
+    let geo_statistics = None;  
 
     //let repetition_level_histogram = repetition_level_histogram.map(LevelHistogram::from);
     //let definition_level_histogram = definition_level_histogram.map(LevelHistogram::from);
