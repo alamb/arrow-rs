@@ -116,6 +116,7 @@ impl<T: ArrowPrimitiveType + Debug> InProgressArray for InProgressPrimitiveArray
             .slice(offset, len);
         let s = s.as_primitive::<T>();
 
+        let nulls = s.nulls().filter(|n| n.null_count() > 0);
         let values = s.values();
         let count = filter.count();
 
@@ -123,7 +124,7 @@ impl<T: ArrowPrimitiveType + Debug> InProgressArray for InProgressPrimitiveArray
         match filter.strategy() {
             IterationStrategy::SlicesIterator => {
                 // Copy values, nulls using slices
-                if let Some(nulls) = s.nulls().filter(|n| n.null_count() > 0) {
+                if let Some(nulls) = nulls {
                     for (start, end) in SlicesIterator::new(filter.filter_array()) {
                         // SAFETY: slices are derived from filter predicate
                         self.current
@@ -142,7 +143,7 @@ impl<T: ArrowPrimitiveType + Debug> InProgressArray for InProgressPrimitiveArray
             }
             IterationStrategy::Slices(slices) => {
                 // Copy values and nulls using precomputed slices - single iteration
-                if let Some(nulls) = s.nulls().filter(|n| n.null_count() > 0) {
+                if let Some(nulls) = nulls {
                     for &(start, end) in slices {
                         // SAFETY: slices are derived from filter predicate
                         self.current
@@ -161,7 +162,7 @@ impl<T: ArrowPrimitiveType + Debug> InProgressArray for InProgressPrimitiveArray
             }
             IterationStrategy::IndexIterator => {
                 // Copy values and nulls for each index
-                if let Some(nulls) = s.nulls().filter(|n| n.null_count() > 0) {
+                if let Some(nulls) = nulls {
                     let null_buffer = nulls.inner();
                     let null_ptr = null_buffer.values().as_ptr();
                     let null_offset = null_buffer.offset();
@@ -192,7 +193,7 @@ impl<T: ArrowPrimitiveType + Debug> InProgressArray for InProgressPrimitiveArray
             }
             IterationStrategy::Indices(indices) => {
                 // Copy values and nulls using precomputed indices
-                if let Some(nulls) = s.nulls().filter(|n| n.null_count() > 0) {
+                if let Some(nulls) = nulls {
                     let null_buffer = nulls.inner();
                     let null_ptr = null_buffer.values().as_ptr();
                     let null_offset = null_buffer.offset();
@@ -227,7 +228,7 @@ impl<T: ArrowPrimitiveType + Debug> InProgressArray for InProgressPrimitiveArray
             IterationStrategy::All => {
                 // Copy all values
                 self.current.extend_from_slice(values);
-                if let Some(nulls) = s.nulls() {
+                if let Some(nulls) = nulls {
                     self.nulls.append_buffer(nulls);
                 } else {
                     self.nulls.append_n_non_nulls(values.len());

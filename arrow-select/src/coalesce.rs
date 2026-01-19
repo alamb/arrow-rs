@@ -242,8 +242,8 @@ impl BatchCoalescer {
         batch: RecordBatch,
         filter: &BooleanArray,
     ) -> Result<(), ArrowError> {
-        // We only support primitve now, fallback to filter_record_batch for other types
-        // Also, skip optimization when filter is not very selectivex§
+        // We only support primitive now, fallback to filter_record_batch for other types
+        // Also, skip optimization when filter is not very selective
 
         // Build an optimized filter predicate that chooses the best iteration strategy
         let is_optimize_beneficial = is_optimize_beneficial_record_batch(&batch);
