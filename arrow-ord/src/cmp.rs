@@ -1388,6 +1388,16 @@ mod tests {
     }
 
     #[test]
+    fn test_ree_sliced_different_offsets() {
+        let a = ree_str(&[(Some("a"), 3), (Some("b"), 2)]).slice(1, 4);
+        let b = ree_str(&[(Some("a"), 2), (Some("b"), 3)]).slice(0, 4);
+        assert_eq!(
+            eq(&a, &b).unwrap(),
+            BooleanArray::from(vec![true, true, true, true])
+        );
+    }
+
+    #[test]
     fn test_ree_nullable() {
         let a = ree_str(&[(Some("a"), 2), (None, 1), (Some("b"), 2)]);
 
