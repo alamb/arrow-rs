@@ -1389,7 +1389,9 @@ mod tests {
 
     #[test]
     fn test_ree_sliced_different_offsets() {
+        // left expands to ["a", "a", "b", "b"]
         let a = ree_str(&[(Some("a"), 3), (Some("b"), 2)]).slice(1, 4);
+        // right expands to ["a", "a", "b", "b"]
         let b = ree_str(&[(Some("a"), 2), (Some("b"), 3)]).slice(0, 4);
         assert_eq!(
             eq(&a, &b).unwrap(),
