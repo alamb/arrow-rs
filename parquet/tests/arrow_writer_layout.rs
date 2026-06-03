@@ -20,6 +20,8 @@
 use arrow::array::{Int32Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use arrow_array::builder::{Int32Builder, ListBuilder};
+use arrow_array::types::Int32Type;
+use arrow_array::{DictionaryArray, FixedSizeBinaryArray};
 use bytes::Bytes;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
@@ -605,3 +607,98 @@ fn test_per_column_data_page_size_limit() {
     assert_eq!(col_a_page_count, 16);
     assert_eq!(col_b_page_count, 1);
 }
+
+#[test]
+fn test_fixed_size_binary() {
+    // FixedSizeBinary values larger than the data page byte limit.
+    let value_size = 1024usize;
+    let num_rows = 64usize;
+    let values: Vec<u8> = (0..num_rows)
+        .flat_map(|i| vec![i as u8; value_size])
+        .collect();
+    let array =
+        Arc::new(FixedSizeBinaryArray::try_new(value_size as i32, values.into(), None).unwrap()) as _;
+    let batch = RecordBatch::try_from_iter([("col", array)]).unwrap();
+
+    let props = WriterProperties::builder()
+        .set_dictionary_enabled(false)
+        .set_data_page_size_limit(4096)
+        .set_write_page_header_statistics(true)
+        .build();
+
+    do_test(LayoutTest {
+        props,
+        batches: vec![batch],
+        layout: Layout {
+            row_groups: vec![RowGroup {
+                columns: vec![ColumnChunk {
+                    // 12 pages of 5 values (5 * 1024 = 5120 B, the boundary
+                    // value pushes each page just past the 4096 B limit) plus
+                    // a final page with the remaining 4 values.
+                    pages: (0..12)
+                        .map(|_| Page {
+                            rows: 5,
+                            page_header_size: 157,
+                            compressed_size: 5120,
+                            encoding: Encoding::PLAIN,
+                            page_type: PageType::DATA_PAGE,
+                        })
+                        .chain(std::iter::once(Page {
+                            rows: 4,
+                            page_header_size: 157,
+                            compressed_size: 4096,
+                            encoding: Encoding::PLAIN,
+                            page_type: PageType::DATA_PAGE,
+                        }))
+                        .collect(),
+                    dictionary_page: None,
+                }],
+            }],
+        },
+    });
+}
+
+#[test]
+fn test_dictionary() {
+    // Arrow `DictionaryArray<Int32, Utf8>` input.
+    let num_rows = 2000;
+    let dict_values = StringArray::from_iter_values(["alpha", "beta", "gamma", "delta"]);
+    let keys = Int32Array::from_iter_values((0..num_rows as i32).map(|i| i % 4));
+    let array = Arc::new(DictionaryArray::<Int32Type>::try_new(keys, Arc::new(dict_values)).unwrap())
+        as _;
+    let batch = RecordBatch::try_from_iter([("col", array)]).unwrap();
+
+    let props = WriterProperties::builder()
+        .set_dictionary_enabled(true)
+        .set_dictionary_page_size_limit(1000)
+        .set_data_page_size_limit(1000)
+        .set_write_batch_size(10)
+        .set_write_page_header_statistics(true)
+        .build();
+
+    do_test(LayoutTest {
+        props,
+        batches: vec![batch],
+        layout: Layout {
+            row_groups: vec![RowGroup {
+                columns: vec![ColumnChunk {
+                    pages: vec![Page {
+                        rows: 2000,
+                        page_header_size: 40,
+                        compressed_size: 505,
+                        encoding: Encoding::RLE_DICTIONARY,
+                        page_type: PageType::DATA_PAGE,
+                    }],
+                    dictionary_page: Some(Page {
+                        rows: 4,
+                        page_header_size: 38,
+                        compressed_size: 35,
+                        encoding: Encoding::PLAIN,
+                        page_type: PageType::DICTIONARY_PAGE,
+                    }),
+                }],
+            }],
+        },
+    });
+}
+
