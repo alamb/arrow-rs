@@ -273,12 +273,28 @@ impl ReadPlanBuilder {
             return Ok(self);
         }
         let raw = match (self.selection.as_ref(), self.row_selection_policy) {
+            // A mask-backed prior selection stays mask-backed: `and_then` then
+            // takes the mask/mask path and never materializes selectors.
             (Some(selection), _) if selection.as_mask().is_some() => {
                 RowSelection::from_filters_mask(&filters)
             }
+            // Selector-backed prior selection (e.g. from page index pruning)
+            // under Auto: stop materializing selectors as soon as the predicate
+            // result is fragmented enough that Auto would choose a mask.
+            // `and_then` then streams the mask as runs, so the fragmented
+            // predicate result is never held as a second selector vector.
+            (Some(_selection), RowSelectionPolicy::Auto { threshold }) => {
+                RowSelection::from_filters_auto(&filters, threshold)
+            }
+            // No prior selection under Auto: the backing chosen here is the
+            // one `build` will resolve to, so later predicates and `build`
+            // never need to convert it.
             (None, RowSelectionPolicy::Auto { threshold }) => {
                 RowSelection::from_filters_auto(&filters, threshold)
             }
+            // The final backing is known to be a mask, so build it directly
+            // rather than materializing selectors that `build` would convert.
+            (None, RowSelectionPolicy::Mask) => RowSelection::from_filters_mask(&filters),
             _ => RowSelection::from_filters(&filters),
         };
         self.selection = match self.selection.take() {
